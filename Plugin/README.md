@@ -57,7 +57,7 @@ pnpm verify
 - AI 控制：`browserControlContent.js` 只在 AI 调用浏览器工具时动态注入。
 - native host：正式桌面端启动时会把 Chrome / Edge / Brave 的 Native Messaging manifest 对账到当前 Beav 可执行文件。浏览器启动同一签名应用的隐藏 Native Host 模式，Host 通过 Windows Named Pipe 或 Unix Domain Socket 连接 Desktop Bridge，不监听 TCP 端口。`native-host/host.mjs` 和 Node installer 只保留隔离的 legacy 传输测试。
 - Knowledge / Accounts：插件的保存、查询和账号导入请求均通过 Native Messaging 交给 Desktop Bridge 的 typed allowlist；Host 不代理 HTTP，也不直接写本地业务数据。
-- 自动诊断：连接状态变化、App 未启动、Native Host 重连、用户取消、页面不适用和策略拒绝只保留在本地有界遥测中，不创建反馈工单。只有用户操作产生的非预期终态失败，或不可重试的协议、鉴权、数据完整性错误，才由插件直接提交到公开反馈接口；同一安装上的同一业务操作错误 24 小时最多提交一次，task/message 两层按同一语义合并。用于聚合的安装标识只在本地由随机实例 ID 派生为不可逆短哈希，原始 ID 不会上传。网络不可用时进入插件本地有界队列并自动重试，不依赖 Desktop Bridge。仅保留错误码、阶段、版本、浏览器和站点 origin 等定位元数据，不上传网页正文、Cookie、Token 或完整 URL。
+- 自动诊断：普通连接状态变化、App 未启动、短暂重连、用户取消、页面不适用和策略拒绝只保留在本地有界遥测中，不创建反馈工单。同类原生连接错误持续至少 60 秒且至少观察到 3 次（间隔至少 10 秒）时，插件自动提交连接诊断；检测摘要持久化，MV3 worker 重启可继续计数，恢复连接清除摘要。用户操作产生的非预期终态失败，或不可重试的协议、鉴权、数据完整性错误，也由插件直接提交到公开反馈接口；同一安装上的同一业务操作错误 24 小时最多提交一次，task/message 两层按同一语义合并。用于聚合的安装标识只在本地由随机实例 ID 派生为不可逆短哈希，原始 ID 不会上传。网络不可用时进入插件本地有界队列并自动重试，不依赖 Desktop Bridge。仅保留错误码、阶段、版本、浏览器、系统类别、最近 12 条脱敏连接事件和站点 origin 等定位元数据，不上传网页正文、Cookie、Token 或完整 URL。
 - App 内置 MCP：桌面端启动时会自动注册 `Beav Browser Control` MCP server，stdio command 指向 Beav App 自身的隐藏兼容 `--redbox-browser-control-mcp` 模式，不要求用户手动导入 MCP 配置。
 - App AI 首选入口：模型使用 `browser.connection.status/repair`、`browser.tabs.list`、`browser.tab.open/claim`、`browser.page.inspect/click/type`、`browser.tabs.finalize` 等单一职责 typed action。旧 `browser.control` 只做历史 session 兼容；MCP / Native Host 是后端适配层，不作为普通任务的模型调用面。
 - Agent-side JS client：`scripts/browser-client.mjs` 提供 Codex 同款对象 facade；生产型调试使用 `DesktopBridgeBrowserTransport`，旧 `BrowserControlTransport` 只服务隔离的 legacy contract tests。
@@ -149,3 +149,5 @@ pnpm package
 - `captureRuntime.js` 是平台无关的页面采集底座；平台逻辑应只提供根节点、列表项、字段解析和分页策略，不要把滚动等待、DOM 稳定判断、验证页识别重复写进各个平台 extractor。采集 checkpoint 存在 `redboxCaptureCheckpoints`，用于排查页面刷新、断网或站点限流导致的中断。
 - 知识整理、漫步、RedClaw 创作仍在桌面端完成。
 - 自动更新检查会在插件安装、浏览器启动和后台定时任务中执行；更新源固定为 `https://redbox.ziz.hk/api/updates/plugin`。
+
+连接恢复：`src/background/nativeTransport.js` 对并发连接共用一次握手，并以 Port 身份隔离旧连接回调。Native Host 已启动但 Desktop Bridge 未就绪时，保留健康检查定时器和 MV3 alarm；连接错误码由 background 传到 popup，区分未注册、浏览器拒绝、启动失败、退出和超时。Windows 历史日志显示 2.7.18 时，应核对实际运行版本；Windows 二进制 stdio 修复从桌面 2.7.19 起包含。

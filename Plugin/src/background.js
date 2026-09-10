@@ -2539,10 +2539,12 @@ async function checkDesktopServer(forceRefresh = false) {
       retryable: error?.retryable === true,
       details: error?.details || error?.data || null,
     });
+    const nativeStatus = getNativeStatus();
+    const code = normalizeText(error?.code);
     return {
       success: false,
       error: error instanceof Error ? error.message : String(error),
-      code: normalizeText(error?.code) || 'NATIVE_REQUEST_FAILED',
+      code: (code === 'NATIVE_TRANSPORT_DISCONNECTED' ? nativeStatus.errorCode : code) || 'NATIVE_REQUEST_FAILED',
       phase: normalizeText(error?.phase) || 'native_messaging',
       retryable: error?.retryable === true,
       details: error?.details || error?.data || null,

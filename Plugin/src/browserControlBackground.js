@@ -18,7 +18,7 @@ import { acceptFileChooser, configureFileChooserTelemetry, getFileChooserSnapsho
 import { listPageFrames } from './background/frameRuntime.js';
 import { CLIENT_HEARTBEAT_ALARM, TARGET_CLIENT_HEARTBEAT_ALARM, configureLifecycleGuard, ensureLifecycleInstallState, getBrowserClientHeartbeatState, getLifecycleStatus, handleLifecycleAlarm, maybeReloadForPendingUpdate, recordBrowserClientHeartbeat, recordLifecycleCleanupResult, registerLifecycleUpdateListener, restorePendingUpdate, startClientHeartbeat } from './background/lifecycleGuard.js';
 import { NATIVE_HOST_DEFAULT, configureNativeTransport, connectNativeTransport as connectNativeTransportRaw, disconnectNativeTransport, getNativeStatus, handleNativeReconnectAlarm, postNativeMessage, refreshNativeStatus, requestNativeHost as requestNativeHostRaw, restoreNativeStatus, sendNativeNotification, shouldReportNativeConnectionFailure } from './background/nativeTransport.js';
-import { PLUGIN_DIAGNOSTICS_RETRY_ALARM, drainPluginDiagnostics, reportPluginError } from './background/diagnostics.js';
+import { PLUGIN_DIAGNOSTICS_RETRY_ALARM, drainPluginDiagnostics, reportPluginError, observePluginConnection } from './background/diagnostics.js';
 import { CONTENT_PAGE_ASSETS_TYPE, bundlePageAssets, readPageAssetInventory } from './background/pageAssetRuntime.js';
 import { exportPage } from './background/pageExportRuntime.js';
 import { evaluatePageScript } from './background/pageScriptRuntime.js';
@@ -563,6 +563,7 @@ configureNativeTransport({
   onMessage: handleNativeMessage,
   onStatusChange: (status) => {
     nativeStatus = status;
+    void observePluginConnection(status).catch(() => {});
   },
   onTelemetry: (event) => browserEventBridge.publishNativeTransportEvent(event),
   getRegistration: async () => {

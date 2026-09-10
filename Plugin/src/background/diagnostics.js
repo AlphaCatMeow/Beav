@@ -2,6 +2,7 @@ import { getNativeStatus } from './nativeTransport.js';
 import { EXTENSION_INSTANCE_ID_KEY } from './lifecycleGuard.js';
 
 export const PLUGIN_DIAGNOSTICS_QUEUE_KEY = 'redboxPluginDiagnosticsQueue';
+export const PLUGIN_CONNECTION_INCIDENT_KEY = 'redboxPluginConnectionIncident';
 export const PLUGIN_DIAGNOSTICS_RECENT_KEY = 'redboxPluginDiagnosticsRecent';
 export const PLUGIN_DIAGNOSTICS_RETRY_ALARM = 'redbox-plugin-diagnostics-retry';
 export const PLUGIN_FEEDBACK_ENDPOINT = 'https://api.ziz.hk/beav/v1/public-feedback';
@@ -16,9 +17,67 @@ const MAX_FIELD_CHARS = 500;
 const DIRECT_SUBMIT_TIMEOUT_MS = 8_000;
 const MAX_DELIVERY_ATTEMPTS = 8;
 
+const CONNECTION_FAILURE_CODES = /^(NATIVE_HOST_EXITED|NATIVE_HOST_NOT_REGISTERED|NATIVE_HOST_FORBIDDEN|NATIVE_HOST_START_FAILED|NATIVE_HOST_UPGRADE_REQUIRED|NATIVE_REQUEST_TIMEOUT|NATIVE_TRANSPORT_DISCONNECTED|DESKTOP_BRIDGE_ERROR|.*PROTOCOL_MISMATCH|.*AUTHENTICATION_FAILED|.*VERSION_STALE)$/;
+let connectionObservationPromise = Promise.resolve();
 let drainPromise = null;
 let enqueuePromise = Promise.resolve();
 let installationFingerprintPromise = null;
+
+// Persist only a bounded incident summary so MV3 worker restarts do not reset detection.
+export async function observePluginConnection(status = {}) {
+  const next = connectionObservationPromise.then(() => observeConnection(status));
+  connectionObservationPromise = next.catch(() => {});
+  return await next;
+}
+
+async function observeConnection(status) {
+  const code = String(status.errorCode || '').toUpperCase();
+  if (status.state === 'connected' || status.expectedDisconnect === true
+    || status.lifecycle?.expected === true || !CONNECTION_FAILURE_CODES.test(code)) {
+    await globalThis.chrome?.storage?.local?.set?.({ [PLUGIN_CONNECTION_INCIDENT_KEY]: null });
+    return { skipped: true };
+  }
+  const now = Date.now();
+  const stored = await globalThis.chrome?.storage?.local?.get?.([PLUGIN_CONNECTION_INCIDENT_KEY]);
+  const previous = stored?.[PLUGIN_CONNECTION_INCIDENT_KEY];
+  const sameIncident = previous?.code === code && now >= previous.lastSeenAt
+    && now - previous.lastSeenAt < 5 * 60_000;
+  if (sameIncident && now - previous.lastSeenAt < 10_000) return { skipped: true };
+  const incident = {
+    code,
+    firstSeenAt: sameIncident ? previous.firstSeenAt : now,
+    lastSeenAt: now,
+    observations: sameIncident ? Math.min(999, previous.observations + 1) : 1,
+  };
+  await globalThis.chrome?.storage?.local?.set?.({ [PLUGIN_CONNECTION_INCIDENT_KEY]: incident });
+  if (incident.observations < 3 || now - incident.firstSeenAt < 60_000) return { skipped: true };
+  return await reportPluginError(new Error(`Persistent browser connection failure: ${code}`), {
+    category: 'plugin.connection',
+    event: 'plugin.connection.persistent_failure',
+    operation: 'native-transport',
+    trigger: 'automatic_connection_diagnostic',
+    code,
+    phase: 'native_connection',
+    retryable: true,
+    fields: {
+      confirmedConnectionFailure: true,
+      failureDurationMs: now - incident.firstSeenAt,
+      failureObservations: incident.observations,
+      nativeStatus: compactNativeStatus(status),
+      connectionEvents: compactConnectionEvents(status.telemetry),
+    },
+  });
+}
+
+function compactConnectionEvents(events = []) {
+  return (Array.isArray(events) ? events : []).slice(-12).map((event) => (
+    `at=${Number(event.at) || 0} event=${safeToken(event.type, 'unknown')}`
+    + ` attempt=${Number(event.reconnectAttempt) || 0}`
+    + (event.method ? ` method=${safeToken(event.method, '')}` : '')
+    + (event.errorCode ? ` code=${safeToken(event.errorCode, '')}` : '')
+    + (event.error ? ` error=${redactText(event.error, 160)}` : '')
+  ));
+}
 
 export async function reportPluginError(error, options = {}) {
   const next = enqueuePromise.then(() => enqueuePluginError(error, options));
@@ -219,7 +278,12 @@ export function buildPluginFeedbackRequest(payload = {}, reportId = '') {
       extensionVersion,
       browser,
     },
-    log_text: redactText(`event=${event} trigger=${trigger} code=${code} phase=${phase}`, 600),
+    log_text: redactText([
+      `event=${event} trigger=${trigger} code=${code} phase=${phase}`,
+      `extension=${extensionVersion} browser=${browser} platform=${safeToken(fields.platform, 'unknown')}`,
+      `host=${safeToken(fields.nativeStatus?.nativeHostVersion, 'unknown')} app=${safeToken(fields.nativeStatus?.desktopAppVersion, 'unknown')}`,
+      ...(Array.isArray(fields.connectionEvents) ? fields.connectionEvents.slice(-12) : []),
+    ].join('\n'), 4_000),
     attachments: [],
     context,
   };
@@ -266,6 +330,9 @@ export function classifyPluginDiagnosticSubmission(payload = {}) {
   if (event.endsWith('.recovered')) return { submit: false, reason: 'recovery_telemetry' };
   if (expected || expectedOutcome) return { submit: false, reason: 'expected_outcome' };
   if (category.includes('connection')) {
+    if (fields.confirmedConnectionFailure === true && CONNECTION_FAILURE_CODES.test(code)) {
+      return { submit: true, reason: 'persistent_connection_failure' };
+    }
     return priority === 'high' && fields.retryable !== true
       ? { submit: true, reason: 'actionable_connection_failure' }
       : { submit: false, reason: 'connection_telemetry' };
@@ -315,6 +382,8 @@ export function buildPluginDiagnosticPayload(error, options = {}) {
     source: 'browser_extension',
     extensionVersion: String(manifest.version_name || manifest.version || '').slice(0, 32),
     browser: detectBrowserFamily(),
+    platform: detectPlatform(),
+    browserVersion: String(globalThis.navigator?.userAgent || '').match(/(?:Edg|Chrome|Chromium)\/([\d.]+)/)?.[1] || '',
     operation,
     code,
     phase: safeToken(options.phase || errorRecord.phase || '', ''),
@@ -484,6 +553,7 @@ function compactNativeStatus(status = {}) {
     ? status.handshake.desktopBridge
     : {};
   return {
+    errorCode: safeToken(status.errorCode || '', ''),
     state: safeToken(status.state || 'unknown', 'unknown'),
     reconnectAttempt: Number.isInteger(Number(status.reconnectAttempt))
       ? Number(status.reconnectAttempt)
@@ -567,6 +637,14 @@ async function callChromePromise(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function detectPlatform() {
+  const ua = String(globalThis.navigator?.userAgent || '');
+  if (/Windows/i.test(ua)) return 'windows';
+  if (/Macintosh|Mac OS X/i.test(ua)) return 'macos';
+  if (/Linux/i.test(ua)) return 'linux';
+  return 'unknown';
 }
 
 function detectBrowserFamily() {

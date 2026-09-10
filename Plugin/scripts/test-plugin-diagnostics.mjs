@@ -38,6 +38,8 @@ globalThis.fetch = async (url, options) => {
 
 const {
   PLUGIN_DIAGNOSTICS_QUEUE_KEY,
+  PLUGIN_CONNECTION_INCIDENT_KEY,
+  observePluginConnection,
   PLUGIN_FEEDBACK_ENDPOINT,
   buildPluginDiagnosticPayload,
   classifyPluginDiagnosticSubmission,
@@ -258,6 +260,56 @@ assert.deepEqual(classifyPluginDiagnosticSubmission({
   category: 'plugin.capture',
   fields: { code: 'SPACE_INITIALIZING', retryable: true },
 }), { submit: false, reason: 'expected_outcome' });
+
+const originalNow = Date.now;
+let now = originalNow();
+Date.now = () => now;
+const beforeConnectionReports = fetchCalls.length;
+const failedStatus = {
+  state: 'reconnecting', errorCode: 'NATIVE_REQUEST_TIMEOUT',
+  telemetry: [{ at: now, type: 'connect_failed', reconnectAttempt: 3,
+    errorCode: 'NATIVE_REQUEST_TIMEOUT',
+    error: 'timeout https://example.com/private?token=secret /Users/jam/private/log' }],
+  handshake: { appVersion: '2.8.0', desktopBridge: { connected: false, appVersion: '2.8.0' } },
+};
+try {
+  await observePluginConnection(failedStatus);
+  await observePluginConnection(failedStatus); // Duplicate status notifications are not retries.
+  assert.equal(storage[PLUGIN_CONNECTION_INCIDENT_KEY].observations, 1);
+  now += 30_000;
+  await observePluginConnection(failedStatus);
+  assert.equal(fetchCalls.length, beforeConnectionReports);
+  now += 30_000;
+  // Re-import simulates loss of module memory after an MV3 worker restart.
+  const restarted = await import('../src/background/diagnostics.js?worker-restart-test');
+  globalThis.fetch = async () => { throw new Error('offline'); };
+  await restarted.observePluginConnection(failedStatus);
+  assert.equal(storage[PLUGIN_DIAGNOSTICS_QUEUE_KEY].length, 1);
+  now += 30_000;
+  globalThis.fetch = async (url, options) => {
+    fetchCalls.push({ url, options });
+    return { ok: true, status: 201, json: async () => ({ success: true }) };
+  };
+  await restarted.drainPluginDiagnostics();
+  assert.equal(fetchCalls.length, beforeConnectionReports + 1);
+  const submitted = JSON.parse(fetchCalls.at(-1).options.body);
+  assert.equal(submitted.category, 'plugin_connection');
+  assert.equal(submitted.context.fields.nativeStatus.desktopAppVersion, '2.8.0');
+  assert.equal(submitted.context.fields.failureObservations, 3);
+  assert.match(submitted.log_text, /connect_failed/);
+  assert(!JSON.stringify(submitted).includes('/private'));
+  assert(!JSON.stringify(submitted).includes('token=secret'));
+  await restarted.observePluginConnection(failedStatus);
+  assert.equal(fetchCalls.length, beforeConnectionReports + 1, 'same incident must be deduplicated');
+  await restarted.observePluginConnection({ state: 'connected' });
+  assert.equal(storage[PLUGIN_CONNECTION_INCIDENT_KEY], null);
+  now += 30_000;
+  await restarted.observePluginConnection({ state: 'app_not_running', errorCode: 'APP_NOT_RUNNING' });
+  assert.equal(storage[PLUGIN_CONNECTION_INCIDENT_KEY], null);
+  assert.equal(fetchCalls.length, beforeConnectionReports + 1);
+} finally {
+  Date.now = originalNow;
+}
 
 console.log(JSON.stringify({
   ok: true,

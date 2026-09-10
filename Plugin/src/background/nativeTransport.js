@@ -24,7 +24,7 @@ let nativeReconnectAttempt = 0;
 let nativeReconnectPending = false;
 let nativeReconnectPromise = null;
 let nativeReconnectTimeoutId = null;
-let nativeDisconnectRequested = false;
+let nativeConnectPromise = null;
 let lastNativeLifecycle = null;
 let onNativeMessage = null;
 let onStatusChange = null;
@@ -90,6 +90,14 @@ export async function restoreNativeStatus() {
 }
 
 export async function connectNativeTransport(options = {}) {
+  if (nativeConnectPromise) return await nativeConnectPromise;
+  nativeConnectPromise = performNativeConnect(options).finally(() => {
+    nativeConnectPromise = null;
+  });
+  return await nativeConnectPromise;
+}
+
+async function performNativeConnect(options = {}) {
   const hostName = options.hostName || nativeStatus.hostName || NATIVE_HOST_DEFAULT;
   if (nativePort && !options.force) {
     recordNativeTelemetry('connect_reused', { hostName });
@@ -118,7 +126,9 @@ export async function connectNativeTransport(options = {}) {
     }
     return getNativeStatus();
   }
+  const connectedPort = nativePort;
   nativePort.onMessage.addListener((message) => {
+    if (nativePort !== connectedPort) return;
     if (handleNativeLifecycle(message)) return;
     if (handleNativeResponse(message)) return;
     if (onNativeMessage) {
@@ -127,22 +137,20 @@ export async function connectNativeTransport(options = {}) {
       });
     }
   });
-  const connectedPort = nativePort;
   nativePort.onDisconnect.addListener(() => {
     const error = chrome.runtime.lastError?.message || 'Native host disconnected';
+    // A retired port must never reject requests belonging to its replacement.
+    if (nativePort !== connectedPort) return;
     const errorCode = classifyNativeTransportFailure(error);
     const disconnectError = Object.assign(new Error(error), {
       code: errorCode,
       retryable: true,
     });
-    const disconnectRequested = nativeDisconnectRequested;
-    nativeDisconnectRequested = false;
-    if (nativePort === connectedPort) nativePort = null;
+    nativePort = null;
     rejectPendingNativeRequests(disconnectError);
     const lifecycle = recentNativeLifecycle();
     const expectedDisconnect = lifecycle?.expected === true;
     recordNativeTelemetry('disconnected', { hostName, error, errorCode, expectedDisconnect, lifecycle });
-    if (disconnectRequested) return;
     void setNativeStatus('disconnected', {
       hostName,
       error,
@@ -163,7 +171,6 @@ export async function connectNativeTransport(options = {}) {
     if (nativePort === connectedPort) {
       nativePort = null;
       try {
-        nativeDisconnectRequested = true;
         connectedPort.disconnect();
       } catch {}
     }
@@ -245,7 +252,7 @@ export async function connectNativeTransport(options = {}) {
   if (desktopBridgeConnected) {
     await clearNativeReconnectAlarm();
   } else {
-    scheduleNativeReconnectTimeout();
+    scheduleNativeReconnectTimeout(BRIDGE_HEALTH_CHECK_DELAY_MS);
     await ensureNativeReconnectAlarm();
   }
   return getNativeStatus();
@@ -322,13 +329,19 @@ export function classifyNativeTransportFailure(error = null) {
   if (/native_request_timeout|native transport is busy/.test(message)) {
     return 'NATIVE_REQUEST_TIMEOUT';
   }
+  if (/access to the specified native messaging host is forbidden|native messaging.*(?:forbidden|not allowed)/.test(message)) {
+    return 'NATIVE_HOST_FORBIDDEN';
+  }
+  if (/failed to start native messaging host/.test(message)) {
+    return 'NATIVE_HOST_START_FAILED';
+  }
   if (/native host has exited|native host exited|native host process.*(?:exit|quit|crash)/.test(message)) {
     return 'NATIVE_HOST_EXITED';
   }
   if (/specified native messaging host|native messaging host.*(?:not found|not registered)|host manifest.*(?:not found|missing)/.test(message)) {
     return 'NATIVE_HOST_NOT_REGISTERED';
   }
-  if (/native host version mismatch|desktop bridge.*upgrade|required.*upgrade/.test(message)) {
+  if (/native host (?:major )?version mismatch|desktop bridge.*upgrade|required.*upgrade/.test(message)) {
     return 'NATIVE_HOST_UPGRADE_REQUIRED';
   }
   return 'NATIVE_TRANSPORT_DISCONNECTED';
@@ -342,13 +355,13 @@ export function normalizeProductVersion(value = '') {
 
 export async function disconnectNativeTransport(reason = 'disconnect') {
   recordNativeTelemetry('disconnect_requested', { reason, connected: Boolean(nativePort) });
-  if (nativePort) {
+  const disconnectedPort = nativePort;
+  nativePort = null;
+  if (disconnectedPort) {
     try {
-      nativeDisconnectRequested = true;
-      nativePort.disconnect();
+      disconnectedPort.disconnect();
     } catch {}
   }
-  nativePort = null;
   nativeReconnectPending = false;
   clearNativeReconnectTimeout();
   rejectPendingNativeRequests(new Error(`Native host ${reason}`));
@@ -573,7 +586,8 @@ async function performNativeReconnectAttempt(hostName = '') {
       });
     }
     nativeReconnectPending = false;
-    await scheduleNativeReconnect();
+    if (nativePort) scheduleNativeReconnectTimeout(BRIDGE_HEALTH_CHECK_DELAY_MS);
+    else await scheduleNativeReconnect();
     await ensureNativeReconnectAlarm();
     return getNativeStatus();
   }
@@ -592,7 +606,7 @@ async function performNativeReconnectAttempt(hostName = '') {
 }
 
 function scheduleNativeReconnectTimeout(delayMs = nextNativeReconnectDelayMs()) {
-  if (nativePort || nativeReconnectTimeoutId != null) return;
+  if ((nativePort && nativeStatus.state === 'connected') || nativeReconnectTimeoutId != null) return;
   nativeReconnectTimeoutId = setTimeout(() => {
     nativeReconnectTimeoutId = null;
     void runNativeReconnectAttempt().catch(() => {});

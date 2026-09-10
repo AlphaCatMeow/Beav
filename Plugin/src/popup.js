@@ -359,6 +359,20 @@ function normalizeDesktopConnection(health) {
   ) {
     return { state: 'recovering', ingestAllowed: false, context: null };
   }
+  const nativeFailureHints = {
+    NATIVE_HOST_NOT_REGISTERED: '本机连接未注册，请重启 Beav 后重新加载插件',
+    NATIVE_HOST_FORBIDDEN: '浏览器拒绝本机连接，请使用官方插件并重启 Beav',
+    NATIVE_HOST_START_FAILED: '本机连接程序无法启动，请重启或重新安装 Beav',
+    NATIVE_HOST_EXITED: '本机连接程序已退出，正在重试；请确认 Beav 已更新',
+    NATIVE_REQUEST_TIMEOUT: '本机连接响应超时，正在重试；请重启 Beav 后重新加载插件',
+    DESKTOP_BRIDGE_ERROR: '桌面桥接连接失败，请重启 Beav 后重新加载插件',
+  };
+  if (nativeFailureHints[code]) {
+    return { state: 'attention', ingestAllowed: false, context: null, hint: nativeFailureHints[code] };
+  }
+  if (code === 'NATIVE_TRANSPORT_DISCONNECTED' || code === 'NATIVE_TRANSPORT_BUSY') {
+    return { state: 'recovering', ingestAllowed: false, context: null };
+  }
   if (/UPGRADE|PROTOCOL_MISMATCH|AUTHENTICATION_FAILED|VERSION_STALE/.test(code)) {
     return { state: 'attention', ingestAllowed: false, context: null };
   }
@@ -387,7 +401,7 @@ function renderDesktopConnection() {
     return;
   }
   if (desktopConnection.state === 'attention') {
-    serverStatusEl.textContent = '连接需要处理，请升级 Beav 或重新加载插件';
+    serverStatusEl.textContent = desktopConnection.hint || '连接需要处理，请升级 Beav 或重新加载插件';
     serverStatusEl.className = 'status error';
     return;
   }

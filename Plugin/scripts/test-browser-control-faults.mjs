@@ -11,6 +11,9 @@ import {
   calculateNativeReconnectDelayMs,
   classifyNativeTransportFailure,
   classifyDesktopBridgeHandshake,
+  connectNativeTransport,
+  getNativeStatus,
+  requestNativeHost,
   disconnectNativeTransport,
   handleNativeReconnectAlarm,
   NATIVE_RECONNECT_ALARM,
@@ -34,6 +37,7 @@ try {
   testNativeTransportFailureClassification();
   testDesktopBridgeHandshakeClassification();
   await testNativeReconnectSingleFlight();
+  await testNativePortOwnership();
   console.log(JSON.stringify({
     ok: true,
     isolatedStateRoot: tempRoot,
@@ -47,6 +51,7 @@ try {
       'native_host_major_mismatch_rejected',
       'native_host_reconnect_uses_capped_exponential_backoff',
       'native_host_reconnect_is_single_flight',
+      'concurrent_connects_share_handshake_and_retired_ports_are_ignored',
       'native_host_exit_is_a_typed_recoverable_failure',
       'old_app_requires_upgrade',
       'bridge_error_is_reportable_but_app_not_running_is_suppressed',
@@ -95,9 +100,64 @@ async function testNativeReconnectSingleFlight() {
   delete globalThis.chrome;
 }
 
+async function testNativePortOwnership() {
+  const ports = [];
+  let bridgeConnected = false;
+  globalThis.chrome = {
+    runtime: {
+      getManifest: () => ({ version: '2.7.14' }),
+      connectNative: () => {
+        const port = {
+          message: null,
+          disconnected: null,
+          onMessage: { addListener: (listener) => { port.message = listener; } },
+          onDisconnect: { addListener: (listener) => { port.disconnected = listener; } },
+          disconnect: () => {}, // Chrome may deliver the old callback after replacement.
+          postMessage: (message) => {
+            if (message.method !== 'ping') return;
+            setTimeout(() => port.message({
+              id: message.id,
+              result: { ok: true, appVersion: '2.8.0', desktopBridge: { connected: bridgeConnected } },
+            }), 10);
+          },
+        };
+        ports.push(port);
+        return port;
+      },
+    },
+    storage: { local: { set: async () => {} } },
+    alarms: { get: async () => null, create: async () => {}, clear: async () => {} },
+  };
+  try {
+    const statuses = await Promise.all([
+      connectNativeTransport(),
+      connectNativeTransport({ force: true }),
+      connectNativeTransport(),
+    ]);
+    assert.equal(ports.length, 1);
+    assert.ok(statuses.every((status) => status.state === 'app_not_running'));
+    bridgeConnected = true;
+    await handleNativeReconnectAlarm({ name: NATIVE_RECONNECT_ALARM });
+    assert.equal(ports.length, 1, 'bridge recovery should reuse the live native port');
+    assert.equal(getNativeStatus().state, 'connected');
+    await connectNativeTransport({ force: true });
+    assert.equal(ports.length, 2);
+    const pending = requestNativeHost('ping');
+    ports[0].disconnected();
+    assert.equal((await pending).ok, true);
+    assert.equal(getNativeStatus().state, 'connected');
+  } finally {
+    await disconnectNativeTransport('test_cleanup');
+    delete globalThis.chrome;
+  }
+}
+
 function testNativeTransportFailureClassification() {
   assert.equal(classifyNativeTransportFailure(new Error('Native host has exited.')), 'NATIVE_HOST_EXITED');
   assert.equal(classifyNativeTransportFailure(new Error('Specified native messaging host not found.')), 'NATIVE_HOST_NOT_REGISTERED');
+  assert.equal(classifyNativeTransportFailure(new Error('Access to the specified native messaging host is forbidden.')), 'NATIVE_HOST_FORBIDDEN');
+  assert.equal(classifyNativeTransportFailure(new Error('Failed to start native messaging host.')), 'NATIVE_HOST_START_FAILED');
+  assert.equal(classifyNativeTransportFailure(new Error('Native host major version mismatch: extension 2.7.14, host 3.0.0')), 'NATIVE_HOST_UPGRADE_REQUIRED');
   assert.equal(classifyNativeTransportFailure(new Error('native_request_timeout: desktop.health')), 'NATIVE_REQUEST_TIMEOUT');
   assert.equal(classifyNativeTransportFailure(new Error('Native transport is disconnected; reconnect is pending')), 'NATIVE_TRANSPORT_DISCONNECTED');
 }
