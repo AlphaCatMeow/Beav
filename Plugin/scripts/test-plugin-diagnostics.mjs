@@ -13,7 +13,7 @@ globalThis.chrome = {
   storage: {
     local: {
       get: async (keys) => Object.fromEntries(
-        (Array.isArray(keys) ? keys : Object.keys(keys || {})).map((key) => [key, storage[key]]),
+        (Array.isArray(keys) ? keys : typeof keys === 'string' ? [keys] : Object.keys(keys || {})).map((key) => [key, storage[key]]),
       ),
       set: async (values) => Object.assign(storage, values),
     },
@@ -39,6 +39,7 @@ globalThis.fetch = async (url, options) => {
 const {
   PLUGIN_DIAGNOSTICS_QUEUE_KEY,
   PLUGIN_CONNECTION_INCIDENT_KEY,
+  PLUGIN_DIAGNOSTICS_DELIVERY_KEY,
   observePluginConnection,
   PLUGIN_FEEDBACK_ENDPOINT,
   buildPluginDiagnosticPayload,
@@ -159,6 +160,7 @@ const first = await reportPluginError(new Error('source API failed'), {
   retryable: true,
 });
 assert.equal(first.sent, 1);
+assert.equal(storage[PLUGIN_DIAGNOSTICS_DELIVERY_KEY].status, 'sent');
 assert.equal(first.queued, 0);
 assert.equal(storage[PLUGIN_DIAGNOSTICS_QUEUE_KEY].length, 0);
 assert.equal(fetchCalls.length, 1);
@@ -200,6 +202,8 @@ const offline = await reportPluginError(new Error('capture unavailable'), {
   phase: 'content_script',
 });
 assert.equal(offline.sent, 0);
+assert.equal(storage[PLUGIN_DIAGNOSTICS_DELIVERY_KEY].status, 'retry_pending');
+assert.match(storage[PLUGIN_DIAGNOSTICS_DELIVERY_KEY].error, /network offline/);
 assert.equal(offline.queued, 1);
 assert.equal(storage[PLUGIN_DIAGNOSTICS_QUEUE_KEY].length, 1);
 
@@ -310,6 +314,38 @@ try {
 } finally {
   Date.now = originalNow;
 }
+
+// An open popup repeatedly checking an unavailable App is actionable; idle absence is not.
+let demandNow = originalNow() + 10 * 60_000;
+Date.now = () => demandNow;
+const demandBefore = fetchCalls.length;
+try {
+  for (let index = 0; index < 3; index += 1) {
+    await observePluginConnection({ state: 'health_check_failed', errorCode: 'APP_BRIDGE_UNAVAILABLE' }, { userRequested: true });
+    demandNow += 30_000;
+  }
+  assert.equal(fetchCalls.length, demandBefore + 1);
+  assert.equal(JSON.parse(fetchCalls.at(-1).options.body).context.fields.userRequested, true);
+  await observePluginConnection({ state: 'connected' });
+} finally {
+  Date.now = originalNow;
+}
+
+// Receiving HTTP 200 with an explicit failure must not be recorded as sent.
+globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ success: false, message: 'rejected by gateway' }) });
+const rejected = await reportPluginError(new Error('delivery regression check'), {
+  code: 'DIAGNOSTIC_DELIVERY_REGRESSION', category: 'plugin.capture', operation: 'test.delivery',
+});
+assert.equal(rejected.sent, 0);
+assert.equal(storage[PLUGIN_DIAGNOSTICS_DELIVERY_KEY].status, 'retry_pending');
+assert.match(storage[PLUGIN_DIAGNOSTICS_DELIVERY_KEY].error, /rejected by gateway/);
+
+globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+const unacknowledged = await reportPluginError(new Error('missing acknowledgement check'), {
+  code: 'DIAGNOSTIC_ACK_REGRESSION', category: 'plugin.capture', operation: 'test.ack',
+});
+assert.equal(unacknowledged.sent, 0);
+assert.match(storage[PLUGIN_DIAGNOSTICS_DELIVERY_KEY].error, /did not acknowledge/);
 
 console.log(JSON.stringify({
   ok: true,

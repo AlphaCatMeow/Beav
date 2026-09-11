@@ -365,6 +365,7 @@ function normalizeDesktopConnection(health) {
     NATIVE_HOST_START_FAILED: '本机连接程序无法启动，请重启或重新安装 Beav',
     NATIVE_HOST_EXITED: '本机连接程序已退出，正在重试；请确认 Beav 已更新',
     NATIVE_REQUEST_TIMEOUT: '本机连接响应超时，正在重试；请重启 Beav 后重新加载插件',
+    NATIVE_RESPONSE_INVALID: '本机连接返回异常，请重启 Beav 后重新加载插件',
     DESKTOP_BRIDGE_ERROR: '桌面桥接连接失败，请重启 Beav 后重新加载插件',
   };
   if (nativeFailureHints[code]) {

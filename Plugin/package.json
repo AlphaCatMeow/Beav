@@ -1,7 +1,7 @@
 {
   "name": "beav",
   "private": true,
-  "version": "2.7.15",
+  "version": "2.7.16",
   "type": "module",
   "engines": {
     "node": ">=22 <23"
@@ -11,7 +11,7 @@
     "build": "node scripts/sync-manifest-version.mjs && node scripts/build.mjs",
     "verify": "node scripts/verify-build.mjs",
     "typecheck": "tsc --noEmit",
-    "check": "pnpm build && pnpm verify && pnpm typecheck && pnpm test:desktop-bridge-client && pnpm test:site-research && pnpm test:generic-capture && pnpm test:plugin-diagnostics",
+    "check": "pnpm build && pnpm verify && pnpm typecheck && pnpm test:desktop-bridge-client && pnpm test:site-research && pnpm test:generic-capture && pnpm test:plugin-diagnostics && pnpm test:native-connection-diagnostics",
     "install:native-host": "node install-native-host.mjs",
     "diagnose:browser-control": "node scripts/diagnose-browser-control.mjs",
     "test:browser-control-faults": "node scripts/test-browser-control-faults.mjs",
@@ -26,6 +26,7 @@
     "test:cdp-event-replay": "node scripts/test-cdp-event-replay.mjs",
     "test:cdp-policy-classification": "node scripts/test-cdp-policy-classification.mjs",
     "test:desktop-bridge-client": "node scripts/test-desktop-bridge-client.mjs",
+    "test:native-connection-diagnostics": "node scripts/test-native-connection-diagnostics.mjs",
     "test:plugin-diagnostics": "node scripts/test-plugin-diagnostics.mjs",
     "test:site-research": "node --test scripts/test-site-research-runtime.mjs",
     "test:generic-capture": "node --test scripts/test-generic-capture.mjs",

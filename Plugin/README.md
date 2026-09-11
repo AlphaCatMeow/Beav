@@ -57,7 +57,7 @@ pnpm verify
 - AI 控制：`browserControlContent.js` 只在 AI 调用浏览器工具时动态注入。
 - native host：正式桌面端启动时会把 Chrome / Edge / Brave 的 Native Messaging manifest 对账到当前 Beav 可执行文件。浏览器启动同一签名应用的隐藏 Native Host 模式，Host 通过 Windows Named Pipe 或 Unix Domain Socket 连接 Desktop Bridge，不监听 TCP 端口。`native-host/host.mjs` 和 Node installer 只保留隔离的 legacy 传输测试。
 - Knowledge / Accounts：插件的保存、查询和账号导入请求均通过 Native Messaging 交给 Desktop Bridge 的 typed allowlist；Host 不代理 HTTP，也不直接写本地业务数据。
-- 自动诊断：普通连接状态变化、App 未启动、短暂重连、用户取消、页面不适用和策略拒绝只保留在本地有界遥测中，不创建反馈工单。同类原生连接错误持续至少 60 秒且至少观察到 3 次（间隔至少 10 秒）时，插件自动提交连接诊断；检测摘要持久化，MV3 worker 重启可继续计数，恢复连接清除摘要。用户操作产生的非预期终态失败，或不可重试的协议、鉴权、数据完整性错误，也由插件直接提交到公开反馈接口；同一安装上的同一业务操作错误 24 小时最多提交一次，task/message 两层按同一语义合并。用于聚合的安装标识只在本地由随机实例 ID 派生为不可逆短哈希，原始 ID 不会上传。网络不可用时进入插件本地有界队列并自动重试，不依赖 Desktop Bridge。仅保留错误码、阶段、版本、浏览器、系统类别、最近 12 条脱敏连接事件和站点 origin 等定位元数据，不上传网页正文、Cookie、Token 或完整 URL。
+- 自动诊断：普通连接状态变化、App 未启动、短暂重连、用户取消、页面不适用和策略拒绝只保留在本地有界遥测中，不创建反馈工单。原生连接错误持续至少 60 秒且至少观察到 3 次（间隔至少 10 秒）时，插件自动提交连接诊断；不同错误码属于同一未恢复事件，检测摘要和首次错误持久化，MV3 worker 重启可继续计数，恢复连接清除摘要。弹窗/设置中持续主动检查却无法连接 App 时也自动反馈；仅后台 App 未运行不报。初始化异常直接记录并上报。用户操作产生的非预期终态失败，或不可重试的协议、鉴权、数据完整性错误，也由插件直接提交到公开反馈接口；同一安装上的同一业务操作错误 24 小时最多提交一次，task/message 两层按同一语义合并。用于聚合的安装标识只在本地由随机实例 ID 派生为不可逆短哈希，原始 ID 不会上传。网络不可用时进入插件本地有界队列并自动重试，不依赖 Desktop Bridge。仅保留错误码、阶段、版本、浏览器、系统类别、最近 40 条脱敏连接事件和站点 origin 等定位元数据，不上传网页正文、Cookie、Token 或完整 URL。
 - App 内置 MCP：桌面端启动时会自动注册 `Beav Browser Control` MCP server，stdio command 指向 Beav App 自身的隐藏兼容 `--redbox-browser-control-mcp` 模式，不要求用户手动导入 MCP 配置。
 - App AI 首选入口：模型使用 `browser.connection.status/repair`、`browser.tabs.list`、`browser.tab.open/claim`、`browser.page.inspect/click/type`、`browser.tabs.finalize` 等单一职责 typed action。旧 `browser.control` 只做历史 session 兼容；MCP / Native Host 是后端适配层，不作为普通任务的模型调用面。
 - Agent-side JS client：`scripts/browser-client.mjs` 提供 Codex 同款对象 facade；生产型调试使用 `DesktopBridgeBrowserTransport`，旧 `BrowserControlTransport` 只服务隔离的 legacy contract tests。
@@ -151,3 +151,20 @@ pnpm package
 - 自动更新检查会在插件安装、浏览器启动和后台定时任务中执行；更新源固定为 `https://redbox.ziz.hk/api/updates/plugin`。
 
 连接恢复：`src/background/nativeTransport.js` 对并发连接共用一次握手，并以 Port 身份隔离旧连接回调。Native Host 已启动但 Desktop Bridge 未就绪时，保留健康检查定时器和 MV3 alarm；连接错误码由 background 传到 popup，区分未注册、浏览器拒绝、启动失败、退出和超时。Windows 历史日志显示 2.7.18 时，应核对实际运行版本；Windows 二进制 stdio 修复从桌面 2.7.19 起包含。
+
+### 2.7.16 连接诊断
+
+Windows 支持修复包源码位于 `support/windows-connection-repair/`。`Run-Repair.cmd` 启动 PowerShell，使用当前运行的 Beav 直接测试二进制 ping，备份注册并调用现有 `--install-browser-native-host`，校正当前用户 32/64 位注册视图；失败证据自动通过既有 public-feedback 提交。此工具独立分发，未改 App、插件运行逻辑或服务器。直接启动测试不等价于 Edge 实际恢复；Windows 现场验收待用户运行。
+
+`nativeTransport.js` 记录每次连接的阶段、Port 创建、首消息、ping 发出与响应时间、请求超时及耗时、最早和最近失败。Port 创建只证明浏览器返回了句柄；没有首消息时，不把 Host 进程或 App 版本标为已确认。断开后的健康检查保留 `details.causeCode/causeMessage/causePhase`，防止 `NATIVE_TRANSPORT_DISCONNECTED` 覆盖最初原因。
+
+`diagnostics.js` 自动报告包含：
+
+- 插件版本、扩展 ID、自身安装类型、浏览器版本、系统/架构与可取得的系统版本；本插件实际获得的 Native Messaging 和反馈域权限。
+- Host/App 版本与握手时间、桥接错误、注册结果、最近一次连接成功时间、首次失败和最近失败。
+- 最多 40 条脱敏连接事件、每次尝试关联号及耗时；仅记录连接相关 RPC 名称，不采集网页内容或业务请求参数。
+- 本地 `redboxPluginDiagnosticsDelivery` 保存上报 ID、HTTP 状态、后台反馈 ID、尝试次数及失败原因。只有有效确认响应才记为送达；离线有限补发和 24 小时事件去重沿用现有队列。队列读改写串行，网络发送不占用存储队列。
+
+失败首次安装也会生成随机安装指纹，上传的是哈希；不会上传原始实例 ID。Chrome API 未提供的字段写为 unknown/null。未增加 `management` 权限，不枚举其他扩展；插件无法读取未连通的 Windows Host 日志，这些限制会写入报告。权限依据：[runtime.getPlatformInfo](https://developer.chrome.com/docs/extensions/reference/api/runtime#method-getPlatformInfo)、[management.getSelf](https://developer.chrome.com/docs/extensions/reference/api/management#method-getSelf)。
+
+验证：`pnpm test:native-connection-diagnostics` 将实际 transport 和 diagnostics 模块串联，覆盖未注册、退出、超时、异常回包、交替错误、旧升级状态、桥接异常、连接成功与普通 App 未启动。`pnpm test:plugin-diagnostics` 覆盖脱敏、worker 恢复、离线补发、用户主动检查和无确认响应。服务器与 Agent 业务编排未改变。

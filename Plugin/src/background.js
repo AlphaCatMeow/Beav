@@ -1,6 +1,6 @@
 import './browserControlBackground.js';
 import { getNativeStatus, requestNativeHost } from './background/nativeTransport.js';
-import { reportPluginError } from './background/diagnostics.js';
+import { reportPluginError, observePluginConnection } from './background/diagnostics.js';
 import { genericCaptureCoordinator, clearGenericCaptureCache } from './background/genericCaptureCoordinator.js';
 import {
   buildKnowledgeEntryFromCaptureDocument,
@@ -384,7 +384,7 @@ async function handleMessage(message, sender) {
       }
       return { success: true };
     case 'healthcheck':
-      return await checkDesktopServer(message?.forceRefresh === true);
+      return await checkDesktopServer(message?.forceRefresh === true, true);
     case 'plugin-update:get-status':
       return await getPluginUpdateStatus(message?.refresh === true);
     case 'plugin-update:check':
@@ -410,7 +410,7 @@ async function handleMessage(message, sender) {
       return { success: true, settings: await writePluginSettings(DEFAULT_PLUGIN_SETTINGS) };
     case 'settings:test-connection':
       clearCachedKnowledgeApi();
-      return await checkDesktopServer(true);
+      return await checkDesktopServer(true, true);
     case 'capture:platform-save-safety-notice:get':
       return {
         success: true,
@@ -2509,7 +2509,7 @@ async function checkForPluginUpdates(options = {}) {
   }
 }
 
-async function checkDesktopServer(forceRefresh = false) {
+async function checkDesktopServer(forceRefresh = false, userRequested = false) {
   try {
     if (forceRefresh) clearCachedKnowledgeApi();
     const result = await requestDesktopHealth();
@@ -2532,19 +2532,34 @@ async function checkDesktopServer(forceRefresh = false) {
       },
     };
   } catch (error) {
+    const nativeStatus = getNativeStatus();
+    const code = normalizeText(error?.code);
+    const causeCode = code === 'NATIVE_TRANSPORT_DISCONNECTED'
+      ? normalizeText(error?.details?.causeCode) || nativeStatus.errorCode || code
+      : code || 'NATIVE_REQUEST_FAILED';
     pluginError('healthcheck-failed', {
       error: describeError(error),
-      code: error?.code || 'NATIVE_REQUEST_FAILED',
+      code: causeCode,
       phase: error?.phase || 'native_messaging',
       retryable: error?.retryable === true,
       details: error?.details || error?.data || null,
     });
-    const nativeStatus = getNativeStatus();
-    const code = normalizeText(error?.code);
+    if (userRequested) {
+      void observePluginConnection({
+        ...nativeStatus,
+        state: 'health_check_failed',
+        errorCode: causeCode,
+        lastFailure: nativeStatus.lastFailure || {
+          at: Date.now(), code: causeCode, phase: error?.details?.method || error?.phase || 'desktop_health',
+          message: error instanceof Error ? error.message : String(error), attemptId: nativeStatus.currentAttempt?.id || '',
+        },
+        error: error instanceof Error ? error.message : String(error),
+      }, { userRequested: true }).catch(() => {});
+    }
     return {
       success: false,
       error: error instanceof Error ? error.message : String(error),
-      code: (code === 'NATIVE_TRANSPORT_DISCONNECTED' ? nativeStatus.errorCode : code) || 'NATIVE_REQUEST_FAILED',
+      code: causeCode,
       phase: normalizeText(error?.phase) || 'native_messaging',
       retryable: error?.retryable === true,
       details: error?.details || error?.data || null,

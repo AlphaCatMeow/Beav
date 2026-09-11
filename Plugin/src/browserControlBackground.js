@@ -76,6 +76,7 @@ let cachedBaseUrl = null;
 let activeRun = null;
 let activeBrowserSession = null;
 let initializePromise = null;
+let initializationPhase = 'not_started';
 let nativeStatus = getNativeStatus();
 let lastClientHeartbeatState = null;
 const activeTabObserver = createActiveTabObserver({
@@ -777,10 +778,14 @@ async function handleMessage(message, sender = {}) {
 }
 
 async function initialize() {
+  initializationPhase = 'heartbeat';
   await startClientHeartbeat();
   await restoreSidePanelStatus();
+  initializationPhase = 'restore_native_status';
   await restoreNativeStatus();
+  initializationPhase = 'native_connect';
   await connectNativeTransport({ silent: true }).catch(() => {});
+  initializationPhase = 'restore_browser_observers';
   lastClientHeartbeatState = await getBrowserClientHeartbeatState().catch(() => null);
   await restorePendingUpdate();
   await activeTabObserver.initialize().catch(() => {});
@@ -838,6 +843,14 @@ function ensureInitialized() {
 }
 
 void ensureInitialized().catch((error) => {
+  queuePluginDiagnostic(error, {
+    category: 'plugin.connection',
+    event: 'plugin.connection.initialization_failed',
+    operation: 'plugin.initialize',
+    code: 'PLUGIN_INITIALIZATION_FAILED',
+    phase: initializationPhase,
+    fields: { confirmedConnectionFailure: true },
+  });
   setStatus({
     connected: false,
     lastError: describeError(error),

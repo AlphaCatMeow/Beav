@@ -1,7 +1,8 @@
 import { getNativeStatus } from './nativeTransport.js';
-import { EXTENSION_INSTANCE_ID_KEY } from './lifecycleGuard.js';
+import { ensureLifecycleInstallState } from './lifecycleGuard.js';
 
 export const PLUGIN_DIAGNOSTICS_QUEUE_KEY = 'redboxPluginDiagnosticsQueue';
+export const PLUGIN_DIAGNOSTICS_DELIVERY_KEY = 'redboxPluginDiagnosticsDelivery';
 export const PLUGIN_CONNECTION_INCIDENT_KEY = 'redboxPluginConnectionIncident';
 export const PLUGIN_DIAGNOSTICS_RECENT_KEY = 'redboxPluginDiagnosticsRecent';
 export const PLUGIN_DIAGNOSTICS_RETRY_ALARM = 'redbox-plugin-diagnostics-retry';
@@ -17,66 +18,171 @@ const MAX_FIELD_CHARS = 500;
 const DIRECT_SUBMIT_TIMEOUT_MS = 8_000;
 const MAX_DELIVERY_ATTEMPTS = 8;
 
-const CONNECTION_FAILURE_CODES = /^(NATIVE_HOST_EXITED|NATIVE_HOST_NOT_REGISTERED|NATIVE_HOST_FORBIDDEN|NATIVE_HOST_START_FAILED|NATIVE_HOST_UPGRADE_REQUIRED|NATIVE_REQUEST_TIMEOUT|NATIVE_TRANSPORT_DISCONNECTED|DESKTOP_BRIDGE_ERROR|.*PROTOCOL_MISMATCH|.*AUTHENTICATION_FAILED|.*VERSION_STALE)$/;
+const CONNECTION_FAILURE_CODES = /^(NATIVE_HOST_EXITED|NATIVE_HOST_NOT_REGISTERED|NATIVE_HOST_FORBIDDEN|NATIVE_HOST_START_FAILED|NATIVE_HOST_UPGRADE_REQUIRED|NATIVE_REQUEST_TIMEOUT|NATIVE_TRANSPORT_DISCONNECTED|NATIVE_RESPONSE_INVALID|PLUGIN_INITIALIZATION_FAILED|DESKTOP_BRIDGE_ERROR|DESKTOP_BRIDGE_DISCONNECTED|.*PROTOCOL_MISMATCH|.*AUTHENTICATION_FAILED|.*VERSION_STALE)$/;
+const APP_UNAVAILABLE_CODES = /^(APP_NOT_RUNNING|APP_STARTING|APP_SHUTTING_DOWN|APP_BRIDGE_UNAVAILABLE)$/;
+const CONNECTION_EVENT_LIMIT = 40;
 let connectionObservationPromise = Promise.resolve();
 let drainPromise = null;
 let enqueuePromise = Promise.resolve();
+let storeMutationPromise = Promise.resolve();
 let installationFingerprintPromise = null;
+let environmentPromise = null;
 
-// Persist only a bounded incident summary so MV3 worker restarts do not reset detection.
-export async function observePluginConnection(status = {}) {
-  const next = connectionObservationPromise.then(() => observeConnection(status));
+// Store the first failure and a bounded timeline across MV3 worker restarts.
+export async function observePluginConnection(status = {}, options = {}) {
+  const snapshot = structuredClone(status);
+  const next = connectionObservationPromise.then(() => observeConnection(snapshot, options));
   connectionObservationPromise = next.catch(() => {});
   return await next;
 }
 
-async function observeConnection(status) {
+async function observeConnection(status, options) {
   const code = String(status.errorCode || '').toUpperCase();
-  if (status.state === 'connected' || status.expectedDisconnect === true
-    || status.lifecycle?.expected === true || !CONNECTION_FAILURE_CODES.test(code)) {
-    await globalThis.chrome?.storage?.local?.set?.({ [PLUGIN_CONNECTION_INCIDENT_KEY]: null });
-    return { skipped: true };
-  }
   const now = Date.now();
   const stored = await globalThis.chrome?.storage?.local?.get?.([PLUGIN_CONNECTION_INCIDENT_KEY]);
   const previous = stored?.[PLUGIN_CONNECTION_INCIDENT_KEY];
-  const sameIncident = previous?.code === code && now >= previous.lastSeenAt
-    && now - previous.lastSeenAt < 5 * 60_000;
-  if (sameIncident && now - previous.lastSeenAt < 10_000) return { skipped: true };
+  const expectedLifecycle = (status.expectedDisconnect === true || status.lifecycle?.expected === true)
+    && now - Number(status.lifecycle?.atMs || status.lastChecked || 0) < 20_000;
+  const appUnavailable = APP_UNAVAILABLE_CODES.test(code);
+  const userRequested = options.userRequested === true
+    || (Number(previous?.lastUserCheckAt || 0) > now - 90_000);
+  if (status.state === 'connected' || status.error === 'manual_disconnect' || expectedLifecycle
+    || (appUnavailable && !userRequested)) {
+    await globalThis.chrome?.storage?.local?.set?.({ [PLUGIN_CONNECTION_INCIDENT_KEY]: null });
+    return { skipped: true };
+  }
+  // Intermediate status notifications are not recovery and must not erase the first error.
+  if (!CONNECTION_FAILURE_CODES.test(code) && !appUnavailable && status.state !== 'bridge_error') {
+    return { skipped: true };
+  }
+  const sameIncident = previous && now >= previous.lastSeenAt && now - previous.lastSeenAt < 5 * 60_000;
+  const sampled = !sameIncident || now - Number(previous.lastCountedAt || previous.lastSeenAt) >= 10_000;
+  const firstFailure = sameIncident && previous.firstFailure ? previous.firstFailure : compactFailure(status.firstFailure || status.lastFailure || {
+    at: now, code, phase: status.lastFailure?.phase || status.currentAttempt?.phase || 'native_connection',
+    message: status.error, attemptId: status.currentAttempt?.id,
+  });
   const incident = {
-    code,
+    code: sameIncident ? previous.code : code,
     firstSeenAt: sameIncident ? previous.firstSeenAt : now,
     lastSeenAt: now,
-    observations: sameIncident ? Math.min(999, previous.observations + 1) : 1,
+    lastCountedAt: sampled ? now : previous.lastCountedAt || previous.lastSeenAt,
+    observations: sameIncident ? Math.min(999, previous.observations + (sampled ? 1 : 0)) : 1,
+    lastUserCheckAt: options.userRequested === true ? now : Number(previous?.lastUserCheckAt || 0),
+    firstFailure,
+    latestFailure: compactFailure(status.lastFailure || { at: now, code, message: status.error, phase: status.currentAttempt?.phase }),
+    events: [...new Set([
+      ...(sameIncident && Array.isArray(previous.events) ? previous.events : []),
+      ...compactConnectionEvents(status.telemetry),
+    ])].slice(-CONNECTION_EVENT_LIMIT),
   };
   await globalThis.chrome?.storage?.local?.set?.({ [PLUGIN_CONNECTION_INCIDENT_KEY]: incident });
-  if (incident.observations < 3 || now - incident.firstSeenAt < 60_000) return { skipped: true };
-  return await reportPluginError(new Error(`Persistent browser connection failure: ${code}`), {
+  if (incident.observations < 3 || now - incident.firstSeenAt < 60_000 || !sampled) return { skipped: true };
+  return await reportPluginError(new Error(`Persistent browser connection failure: ${incident.code}`), {
     category: 'plugin.connection',
     event: 'plugin.connection.persistent_failure',
     operation: 'native-transport',
     trigger: 'automatic_connection_diagnostic',
-    code,
+    code: incident.code,
     phase: 'native_connection',
     retryable: true,
     fields: {
       confirmedConnectionFailure: true,
+      userRequested: incident.lastUserCheckAt > 0,
       failureDurationMs: now - incident.firstSeenAt,
       failureObservations: incident.observations,
+      firstFailure: incident.firstFailure,
+      latestFailure: incident.latestFailure,
       nativeStatus: compactNativeStatus(status),
-      connectionEvents: compactConnectionEvents(status.telemetry),
+      connectionFacts: compactConnectionFacts(status),
+      connectionEvents: incident.events,
     },
   });
 }
 
+function compactFailure(failure = {}) {
+  return {
+    at: Number(failure.at) || 0,
+    code: safeToken(failure.code, 'unknown'),
+    phase: safeToken(failure.phase, 'unknown'),
+    message: redactText(failure.message || '', 400),
+    attemptId: safeToken(failure.attemptId, ''),
+  };
+}
+
+function compactConnectionFacts(status = {}) {
+  const attempt = status.currentAttempt || {};
+  return {
+    workerStartedAt: Number(status.workerStartedAt) || 0,
+    attemptId: safeToken(attempt.id, ''),
+    attemptStartedAt: Number(attempt.startedAt) || 0,
+    phase: safeToken(attempt.phase, 'not_started'),
+    portOpenedAt: Number(attempt.portOpenedAt) || 0,
+    firstMessageAt: Number(attempt.firstMessageAt) || 0,
+    receivedMessages: Number(attempt.receivedMessages) || 0,
+    pingSentAt: Number(attempt.pingSentAt) || 0,
+    pingResponseAt: Number(attempt.pingResponseAt) || 0,
+    handshakeReceivedAt: Number(status.handshakeReceivedAt) || 0,
+    lastConnectedAt: Number(status.lastConnectedAt) || 0,
+    registrationSucceeded: status.registrationSucceeded === true,
+    hostProcessConfirmed: Boolean(attempt.firstMessageAt),
+    hostLogAccess: 'unavailable_from_extension',
+    otherExtensions: 'not_enumerated_no_management_permission',
+  };
+}
+
 function compactConnectionEvents(events = []) {
-  return (Array.isArray(events) ? events : []).slice(-12).map((event) => (
+  return (Array.isArray(events) ? events : []).filter((event) => (
+    !String(event.type || '').startsWith('request_')
+    || ['ping', 'extension.register', 'desktop.health', 'desktop.context'].includes(event.method)
+  )).slice(-CONNECTION_EVENT_LIMIT).map((event) => (
     `at=${Number(event.at) || 0} event=${safeToken(event.type, 'unknown')}`
-    + ` attempt=${Number(event.reconnectAttempt) || 0}`
+    + ` attempt=${safeToken(event.attemptId, '')} retry=${Number(event.reconnectAttempt) || 0}`
+    + ` phase=${safeToken(event.phase, '')} elapsedMs=${Number(event.elapsedMs) || 0}`
     + (event.method ? ` method=${safeToken(event.method, '')}` : '')
+    + (event.timeoutMs ? ` timeoutMs=${Number(event.timeoutMs) || 0}` : '')
     + (event.errorCode ? ` code=${safeToken(event.errorCode, '')}` : '')
+    + (event.hostVersion ? ` host=${safeToken(event.hostVersion, '')}` : '')
+    + (event.appVersion ? ` app=${safeToken(event.appVersion, '')}` : '')
     + (event.error ? ` error=${redactText(event.error, 160)}` : '')
   ));
+}
+
+async function connectionEnvironment() {
+  if (!environmentPromise) environmentPromise = (async () => {
+    const manifest = globalThis.chrome?.runtime?.getManifest?.() || {};
+    const [platform, self, permissions, hints] = await Promise.all([
+      boundedProbe(() => globalThis.chrome?.runtime?.getPlatformInfo?.()),
+      boundedProbe(() => globalThis.chrome?.management?.getSelf?.()),
+      boundedProbe(() => globalThis.chrome?.permissions?.getAll?.()),
+      boundedProbe(() => globalThis.navigator?.userAgentData?.getHighEntropyValues?.(['platformVersion', 'architecture', 'bitness'])),
+    ]);
+    return {
+      extensionId: safeToken(globalThis.chrome?.runtime?.id, 'unknown'),
+      manifestVersion: String(manifest.version || ''),
+      installType: safeToken(self?.installType, 'unknown'),
+      os: safeToken(platform?.os || detectPlatform(), 'unknown'),
+      architecture: safeToken(platform?.arch || hints?.architecture, 'unknown'),
+      bitness: safeToken(hints?.bitness, 'unknown'),
+      osVersion: safeToken(hints?.platformVersion, 'unknown'),
+      nativeMessagingDeclared: manifest.permissions?.includes('nativeMessaging') === true,
+      nativeMessagingGranted: Array.isArray(permissions?.permissions) ? permissions.permissions.includes('nativeMessaging') : null,
+      feedbackOriginGranted: Array.isArray(permissions?.origins)
+        ? permissions.origins.some((origin) => origin === '<all_urls>' || origin === 'https://api.ziz.hk/*') : null,
+    };
+  })().catch(() => ({ probeFailed: true }));
+  return await environmentPromise;
+}
+
+async function boundedProbe(probe) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(probe).catch(() => null),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), 1_000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function reportPluginError(error, options = {}) {
@@ -96,52 +202,30 @@ async function enqueuePluginError(error, options = {}) {
       queued: 0,
     };
   }
+  if (String(payload.category).includes('connection')) {
+    payload.fields.diagnosticVersion = 2;
+    payload.fields.environment = await connectionEnvironment();
+  }
   const installationIdHash = await resolveInstallationFingerprint();
   if (installationIdHash) payload.fields.installationIdHash = installationIdHash;
   const dedupeKey = buildDedupeKey(payload);
   const now = Date.now();
-  const store = await readDiagnosticStore();
-  const recent = pruneRecentReports(store.recent, now);
-  const previousEpisode = readEpisode(recent[dedupeKey]);
-
-  if (previousEpisode && now - previousEpisode.lastSeenAt < SAME_INCIDENT_COOLDOWN_MS) {
-    const episode = nextEpisode(previousEpisode, now);
+  const result = await mutateDiagnosticStore((store) => {
+    const recent = pruneRecentReports(store.recent, now);
+    const previousEpisode = readEpisode(recent[dedupeKey]);
+    if (previousEpisode && now - previousEpisode.lastSeenAt < SAME_INCIDENT_COOLDOWN_MS) {
+      const episode = nextEpisode(previousEpisode, now);
+      recent[dedupeKey] = episode;
+      return {
+        queue: updateQueuedEpisode(store.queue, dedupeKey, episode, payload),
+        recent,
+        result: { skipped: true, reason: 'active_episode', occurrences: episode.occurrences },
+      };
+    }
+    const episode = { firstSeenAt: now, lastSeenAt: now, occurrences: 1 };
     recent[dedupeKey] = episode;
-    const queue = updateQueuedEpisode(store.queue, dedupeKey, episode);
-    await writeDiagnosticStore({
-      queue,
-      recent: pruneRecentReports(recent, now),
-    });
-    return {
-      ...(await drainPluginDiagnostics()),
-      skipped: true,
-      reason: 'active_episode',
-      occurrences: episode.occurrences,
-    };
-  }
-
-  const episode = {
-    firstSeenAt: now,
-    lastSeenAt: now,
-    occurrences: 1,
-  };
-  recent[dedupeKey] = episode;
-  payload.fields = withEpisodeFields(payload.fields, dedupeKey, episode);
-  const queue = Array.isArray(store.queue) ? store.queue.slice() : [];
-  const existing = queue.find((entry) => entry?.dedupeKey === dedupeKey);
-  if (existing) {
-    existing.lastSeenAt = now;
-    existing.occurrences = Math.min(999, Number(existing.occurrences || 1) + 1);
-    existing.payload = {
-      ...existing.payload,
-      fields: {
-        ...(existing.payload?.fields || {}),
-        occurrences: existing.occurrences,
-        lastSeenAt: new Date(now).toISOString(),
-      },
-    };
-  } else {
-    queue.push({
+    payload.fields = withEpisodeFields(payload.fields, dedupeKey, episode);
+    const entry = {
       id: `plugin-diagnostic-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       dedupeKey,
       queuedAt: now,
@@ -150,18 +234,18 @@ async function enqueuePluginError(error, options = {}) {
       attempts: 0,
       occurrences: 1,
       payload,
-    });
-  }
-
-  const nextQueue = queue
-    .filter((entry) => entry && entry.payload)
-    .slice(-QUEUE_LIMIT);
-  await writeDiagnosticStore({
-    queue: nextQueue,
-    recent: pruneRecentReports(recent, now),
+    };
+    return {
+      queue: [...store.queue.filter((candidate) => candidate.dedupeKey !== dedupeKey), entry].slice(-QUEUE_LIMIT),
+      recent,
+      result: { reportId: entry.id },
+    };
   });
-  await schedulePluginDiagnosticsRetry();
-  return await drainPluginDiagnostics();
+  if (!result.skipped) {
+    await recordDiagnosticDelivery({ status: 'queued', reportId: result.reportId, at: now });
+    await schedulePluginDiagnosticsRetry();
+  }
+  return { ...(await drainPluginDiagnostics()), ...result };
 }
 
 export async function drainPluginDiagnostics() {
@@ -187,12 +271,26 @@ export async function drainPluginDiagnostics() {
       }
       await markAttempt(entry.id, now);
       try {
-        await submitPluginDiagnostic(entry.payload, entry.id);
+        const delivery = await submitPluginDiagnostic(entry.payload, entry.id);
+        await recordDiagnosticDelivery({
+          status: 'sent', reportId: entry.id, at: Date.now(),
+          httpStatus: delivery.status, feedbackId: safeToken(delivery.response?.item?.id || delivery.response?.data?.item?.id, ''),
+          attempts: Number(entry.attempts || 0) + 1,
+        });
         await removeQueuedReport(entry.id);
         sent += 1;
       } catch (error) {
+        await recordDiagnosticDelivery({
+          status: error?.permanent === true ? 'rejected' : 'retry_pending',
+          reportId: entry.id, at: Date.now(), httpStatus: Number(error?.status || 0),
+          error: redactText(error instanceof Error ? error.message : String(error), 400),
+          attempts: Number(entry.attempts || 0) + 1,
+        });
         if (error?.permanent === true || Number(entry.attempts || 0) + 1 >= MAX_DELIVERY_ATTEMPTS) {
           await removeQueuedReport(entry.id);
+          await recordDiagnosticDelivery({ status: 'dropped', reportId: entry.id, at: Date.now(),
+            httpStatus: Number(error?.status || 0), error: redactText(error?.message, 400),
+            reason: error?.permanent === true ? 'permanent_rejection' : 'retry_limit' });
           dropped += 1;
         }
         break;
@@ -226,12 +324,17 @@ export async function submitPluginDiagnostic(payload, reportId = '') {
       signal: controller.signal,
     });
     const responseBody = await response.json().catch(() => ({}));
-    if (!response.ok) {
+    if (!response.ok || responseBody?.success === false) {
       const error = createDiagnosticSendError(
         responseBody?.message || `Plugin diagnostics failed with HTTP ${response.status}`,
       );
       error.status = response.status;
       error.permanent = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
+      throw error;
+    }
+    if (!responseBody?.item?.id && !responseBody?.data?.item?.id && responseBody?.success !== true) {
+      const error = createDiagnosticSendError('Plugin diagnostics response did not acknowledge submission');
+      error.status = response.status;
       throw error;
     }
     return {
@@ -282,8 +385,13 @@ export function buildPluginFeedbackRequest(payload = {}, reportId = '') {
       `event=${event} trigger=${trigger} code=${code} phase=${phase}`,
       `extension=${extensionVersion} browser=${browser} platform=${safeToken(fields.platform, 'unknown')}`,
       `host=${safeToken(fields.nativeStatus?.nativeHostVersion, 'unknown')} app=${safeToken(fields.nativeStatus?.desktopAppVersion, 'unknown')}`,
-      ...(Array.isArray(fields.connectionEvents) ? fields.connectionEvents.slice(-12) : []),
-    ].join('\n'), 4_000),
+      `environment=${JSON.stringify(fields.environment || {})}`,
+      `firstFailure=${JSON.stringify(fields.firstFailure || {})}`,
+      `latestFailure=${JSON.stringify(fields.latestFailure || {})}`,
+      `connectionFacts=${JSON.stringify(fields.connectionFacts || {})}`,
+      `nativeStatus=${JSON.stringify(fields.nativeStatus || {})}`,
+      ...(Array.isArray(fields.connectionEvents) ? fields.connectionEvents.slice(-CONNECTION_EVENT_LIMIT) : []),
+    ].join('\n'), 16_000),
     attachments: [],
     context,
   };
@@ -330,7 +438,7 @@ export function classifyPluginDiagnosticSubmission(payload = {}) {
   if (event.endsWith('.recovered')) return { submit: false, reason: 'recovery_telemetry' };
   if (expected || expectedOutcome) return { submit: false, reason: 'expected_outcome' };
   if (category.includes('connection')) {
-    if (fields.confirmedConnectionFailure === true && CONNECTION_FAILURE_CODES.test(code)) {
+    if (fields.confirmedConnectionFailure === true && (CONNECTION_FAILURE_CODES.test(code) || /^DESKTOP_BRIDGE_/.test(code) || (fields.userRequested === true && APP_UNAVAILABLE_CODES.test(code)))) {
       return { submit: true, reason: 'persistent_connection_failure' };
     }
     return priority === 'high' && fields.retryable !== true
@@ -446,22 +554,34 @@ async function writeDiagnosticStore({ queue, recent }) {
   });
 }
 
+// Serialise storage mutations only; network requests never hold this queue.
+async function mutateDiagnosticStore(update) {
+  const next = storeMutationPromise.then(async () => {
+    const result = update(await readDiagnosticStore());
+    await writeDiagnosticStore(result);
+    return result.result;
+  });
+  storeMutationPromise = next.catch(() => {});
+  return await next;
+}
+
+async function recordDiagnosticDelivery(delivery) {
+  await globalThis.chrome?.storage?.local?.set?.({ [PLUGIN_DIAGNOSTICS_DELIVERY_KEY]: delivery });
+}
+
 async function markAttempt(id, now) {
-  const store = await readDiagnosticStore();
-  const queue = store.queue.map((entry) => (
-    entry.id === id
-      ? { ...entry, attempts: Number(entry.attempts || 0) + 1, lastAttemptAt: now }
-      : entry
-  ));
-  await writeDiagnosticStore({ queue, recent: store.recent });
+  await mutateDiagnosticStore((store) => ({
+    queue: store.queue.map((entry) => entry.id === id
+      ? { ...entry, attempts: Number(entry.attempts || 0) + 1, lastAttemptAt: now } : entry),
+    recent: store.recent,
+  }));
 }
 
 async function removeQueuedReport(id) {
-  const store = await readDiagnosticStore();
-  await writeDiagnosticStore({
+  await mutateDiagnosticStore((store) => ({
     queue: store.queue.filter((entry) => entry.id !== id),
     recent: store.recent,
-  });
+  }));
 }
 
 function pruneRecentReports(recent, now) {
@@ -511,7 +631,7 @@ function withEpisodeFields(fields, incidentKey, episode) {
   };
 }
 
-function updateQueuedEpisode(entries, dedupeKey, episode) {
+function updateQueuedEpisode(entries, dedupeKey, episode, latestPayload) {
   return (Array.isArray(entries) ? entries : []).map((entry) => {
     if (entry?.dedupeKey !== dedupeKey || !entry.payload) return entry;
     return {
@@ -520,7 +640,7 @@ function updateQueuedEpisode(entries, dedupeKey, episode) {
       occurrences: episode.occurrences,
       payload: {
         ...entry.payload,
-        fields: withEpisodeFields(entry.payload.fields, dedupeKey, episode),
+        fields: withEpisodeFields({ ...entry.payload.fields, ...latestPayload?.fields }, dedupeKey, episode),
       },
     };
   });
@@ -529,11 +649,8 @@ function updateQueuedEpisode(entries, dedupeKey, episode) {
 async function resolveInstallationFingerprint() {
   if (!installationFingerprintPromise) {
     installationFingerprintPromise = (async () => {
-      const stored = await callChromePromise(
-        globalThis.chrome?.storage?.local?.get?.(EXTENSION_INSTANCE_ID_KEY),
-        {},
-      );
-      const installationId = String(stored?.[EXTENSION_INSTANCE_ID_KEY] || '').trim();
+      const installation = await ensureLifecycleInstallState();
+      const installationId = String(installation.extensionInstanceId || '').trim();
       if (!installationId || !globalThis.crypto?.subtle || typeof TextEncoder === 'undefined') return '';
       const digest = await globalThis.crypto.subtle.digest(
         'SHA-256',
@@ -586,12 +703,12 @@ function sanitizeValue(value, key = '', depth = 0) {
     return redactText(value, MAX_FIELD_CHARS);
   }
   if (Array.isArray(value)) {
-    return value.slice(0, 12).map((item) => sanitizeValue(item, key, depth + 1));
+    return value.slice(0, key === 'connectionEvents' ? CONNECTION_EVENT_LIMIT : 12).map((item) => sanitizeValue(item, key, depth + 1));
   }
   if (typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value)
-        .slice(0, 24)
+        .slice(0, 40)
         .map(([childKey, childValue]) => [childKey, sanitizeValue(childValue, childKey, depth + 1)]),
     );
   }

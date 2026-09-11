@@ -18,6 +18,9 @@ export const NATIVE_TELEMETRY_LIMIT = 50;
 export const NATIVE_HANDSHAKE_TIMEOUT_MS = 3000;
 export const NATIVE_PENDING_REQUEST_LIMIT = 8;
 
+const workerStartedAt = Date.now();
+const workerId = `worker-${workerStartedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+let nativeAttemptSeq = 0;
 let nativePort = null;
 let nativeRequestSeq = 0;
 let nativeReconnectAttempt = 0;
@@ -41,6 +44,12 @@ let nativeStatus = {
   expectedDisconnect: false,
   lifecycle: null,
   telemetry: [],
+  workerStartedAt,
+  currentAttempt: null,
+  firstFailure: null,
+  lastFailure: null,
+  lastConnectedAt: 0,
+  handshakeReceivedAt: 0,
 };
 
 export function configureNativeTransport(options = {}) {
@@ -51,7 +60,7 @@ export function configureNativeTransport(options = {}) {
 }
 
 export function getNativeStatus() {
-  return { ...nativeStatus, telemetry: nativeTelemetry.slice(-20) };
+  return { ...nativeStatus, telemetry: nativeTelemetry.slice(-NATIVE_TELEMETRY_LIMIT) };
 }
 
 export function refreshNativeStatus() {
@@ -61,7 +70,7 @@ export function refreshNativeStatus() {
     state: nativePort ? nativeStatus.state : 'disconnected',
     lastChecked: Date.now(),
     reconnectAttempt: nativeReconnectAttempt,
-    telemetry: nativeTelemetry.slice(-20),
+    telemetry: nativeTelemetry.slice(-NATIVE_TELEMETRY_LIMIT),
   };
   void persistNativeStatus().catch(() => {});
   onStatusChange?.(getNativeStatus());
@@ -83,7 +92,16 @@ export async function restoreNativeStatus() {
       ...storedStatus,
       state: 'disconnected',
       lastChecked: Date.now(),
+      workerStartedAt,
+      currentAttempt: null,
+      error: '',
+      errorCode: '',
+      firstFailure: storedStatus.expectedDisconnect ? null : storedStatus.firstFailure || null,
+      lastFailure: storedStatus.expectedDisconnect ? null : storedStatus.lastFailure || null,
+      expectedDisconnect: false,
+      lifecycle: null,
     };
+    nativeTelemetry.push(...(Array.isArray(storedStatus.telemetry) ? storedStatus.telemetry : []).slice(-NATIVE_TELEMETRY_LIMIT));
   }
   recordNativeTelemetry('status_restored', { state: nativeStatus.state, hostName: nativeStatus.hostName });
   return await setNativeStatus(nativeStatus.state, { error: nativeStatus.error, hostName: nativeStatus.hostName });
@@ -104,12 +122,28 @@ async function performNativeConnect(options = {}) {
     return getNativeStatus();
   }
   if (nativePort) await disconnectNativeTransport('reconnect');
+  nativeStatus = {
+    ...nativeStatus,
+    expectedDisconnect: false,
+    lifecycle: null,
+    currentAttempt: {
+      id: `${workerId}:${++nativeAttemptSeq}`,
+      startedAt: Date.now(),
+      phase: 'native_connect',
+      portOpenedAt: 0,
+      firstMessageAt: 0,
+      receivedMessages: 0,
+      pingSentAt: 0,
+      pingResponseAt: 0,
+    },
+  };
+  lastNativeLifecycle = null;
   recordNativeTelemetry('connect_started', { hostName, force: options.force === true, silent: options.silent === true });
   try {
     nativePort = chrome.runtime.connectNative(hostName);
   } catch (error) {
-    const errorCode = classifyNativeTransportFailure(error);
-    recordNativeTelemetry('connect_failed', { hostName, error: describeError(error) });
+    const errorCode = recordNativeFailure(error, 'native_connect');
+    recordNativeTelemetry('connect_failed', { hostName, errorCode, error: describeError(error), phase: 'native_connect' });
     await setNativeStatus(options.silent ? 'reconnecting' : 'disconnected', {
       hostName,
       error: describeError(error),
@@ -127,8 +161,18 @@ async function performNativeConnect(options = {}) {
     return getNativeStatus();
   }
   const connectedPort = nativePort;
+  nativeStatus.currentAttempt.portOpenedAt = Date.now();
+  recordNativeTelemetry('native_port_created');
   nativePort.onMessage.addListener((message) => {
     if (nativePort !== connectedPort) return;
+    const attempt = nativeStatus.currentAttempt;
+    if (attempt) {
+      attempt.receivedMessages += 1;
+      if (!attempt.firstMessageAt) {
+        attempt.firstMessageAt = Date.now();
+        recordNativeTelemetry('native_first_message');
+      }
+    }
     if (handleNativeLifecycle(message)) return;
     if (handleNativeResponse(message)) return;
     if (onNativeMessage) {
@@ -141,7 +185,7 @@ async function performNativeConnect(options = {}) {
     const error = chrome.runtime.lastError?.message || 'Native host disconnected';
     // A retired port must never reject requests belonging to its replacement.
     if (nativePort !== connectedPort) return;
-    const errorCode = classifyNativeTransportFailure(error);
+    const errorCode = recordNativeFailure(error, nativeStatus.currentAttempt?.phase || 'native_disconnect');
     const disconnectError = Object.assign(new Error(error), {
       code: errorCode,
       retryable: true,
@@ -161,13 +205,25 @@ async function performNativeConnect(options = {}) {
   });
   let handshake;
   try {
+    nativeStatus.currentAttempt.phase = 'handshake';
+    nativeStatus.currentAttempt.pingSentAt = Date.now();
     handshake = await requestNativeHost('ping', {}, NATIVE_HANDSHAKE_TIMEOUT_MS);
+    nativeStatus.currentAttempt.pingResponseAt = Date.now();
+    nativeStatus.handshakeReceivedAt = Date.now();
+    nativeStatus.handshake = handshake;
+    recordNativeTelemetry('handshake_received', {
+      hostVersion: handshake?.appVersion || '',
+      appVersion: handshake?.desktopBridge?.appVersion || '',
+      bridgeConnected: handshake?.desktopBridge?.connected === true,
+      bridgeErrorCode: handshake?.desktopBridge?.errorCode || '',
+    });
     if (!handshake || handshake.ok !== true) {
       throw new Error('Native host handshake returned an invalid response');
     }
     assertNativeHostVersionCompatibility(handshake);
   } catch (error) {
-    const errorCode = classifyNativeTransportFailure(error);
+    if (error?.code === 'NATIVE_CONNECTION_CANCELLED') return getNativeStatus();
+    const errorCode = recordNativeFailure(error, 'handshake');
     if (nativePort === connectedPort) {
       nativePort = null;
       try {
@@ -175,7 +231,7 @@ async function performNativeConnect(options = {}) {
       } catch {}
     }
     rejectPendingNativeRequests(error);
-    recordNativeTelemetry('connect_failed', { hostName, error: describeError(error), phase: 'handshake' });
+    recordNativeTelemetry('connect_failed', { hostName, errorCode, error: describeError(error), phase: 'handshake' });
     await setNativeStatus(options.silent ? 'reconnecting' : 'disconnected', {
       hostName,
       error: describeError(error),
@@ -198,6 +254,7 @@ async function performNativeConnect(options = {}) {
     try {
       registration = sanitizeNativeRegistration(await getNativeRegistration());
       if (registration) {
+        nativeStatus.currentAttempt.phase = 'extension_registration';
         await requestNativeHost('extension.register', registration, NATIVE_HANDSHAKE_TIMEOUT_MS);
         registrationSucceeded = true;
         recordNativeTelemetry('registration_succeeded', {
@@ -208,6 +265,8 @@ async function performNativeConnect(options = {}) {
         });
       }
     } catch (error) {
+      if (error?.code === 'NATIVE_CONNECTION_CANCELLED') return getNativeStatus();
+      recordNativeFailure(error, 'extension_registration');
       recordNativeTelemetry('registration_failed', {
         hostName,
         error: describeError(error),
@@ -221,6 +280,7 @@ async function performNativeConnect(options = {}) {
   clearNativeReconnectTimeout();
   const connectionState = classifyDesktopBridgeHandshake(handshake);
   const desktopBridgeConnected = connectionState === 'connected';
+  nativeStatus.currentAttempt.phase = desktopBridgeConnected ? 'connected' : 'desktop_bridge';
   const connectionError = connectionState === 'upgrade_required'
     ? '当前 Beav 版本不支持 Desktop Bridge，请升级 Beav'
     : connectionState === 'bridge_error'
@@ -326,6 +386,9 @@ export function shouldReportNativeConnectionFailure(error = null, status = nativ
 
 export function classifyNativeTransportFailure(error = null) {
   const message = describeError(error).toLowerCase();
+  if (/invalid response|native response .*|handshake returned an invalid/.test(message)) {
+    return 'NATIVE_RESPONSE_INVALID';
+  }
   if (/native_request_timeout|native transport is busy/.test(message)) {
     return 'NATIVE_REQUEST_TIMEOUT';
   }
@@ -364,16 +427,31 @@ export async function disconnectNativeTransport(reason = 'disconnect') {
   }
   nativeReconnectPending = false;
   clearNativeReconnectTimeout();
-  rejectPendingNativeRequests(new Error(`Native host ${reason}`));
+  rejectPendingNativeRequests(Object.assign(new Error(`Native host ${reason}`), {
+    code: 'NATIVE_CONNECTION_CANCELLED', expected: true,
+  }));
   recordNativeTelemetry('disconnected', { reason });
   return await setNativeStatus('disconnected', { error: reason });
 }
 
 export async function requestNativeHost(method, params = {}, timeoutMs = 12_000) {
   if (!nativePort) {
+    const cause = nativeStatus.lastFailure;
+    const details = {
+      nativeState: nativeStatus.state,
+      causeCode: cause?.code || nativeStatus.errorCode || '',
+      causeMessage: cause?.message || nativeStatus.error || '',
+      causePhase: cause?.phase || '',
+      failureAt: cause?.at || 0,
+      attemptId: nativeStatus.currentAttempt?.id || '',
+      portOpen: false,
+      reconnectAttempt: nativeReconnectAttempt,
+    };
     await scheduleNativeReconnect();
     throw Object.assign(new Error(TARGET_NATIVE_DISCONNECTED_ERROR), {
       code: 'NATIVE_TRANSPORT_DISCONNECTED',
+      phase: 'native_messaging',
+      details,
       retryable: true,
     });
   }
@@ -386,6 +464,7 @@ export async function requestNativeHost(method, params = {}, timeoutMs = 12_000)
   nativeRequestSeq += 1;
   const id = `native-host:${nativeRequestSeq}`;
   const message = buildNativeRequestEnvelope(method, params, { id });
+  const startedAt = Date.now();
   recordNativeTelemetry('request_started', {
     id,
     method: message.method,
@@ -395,31 +474,33 @@ export async function requestNativeHost(method, params = {}, timeoutMs = 12_000)
   return await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingNativeRequests.delete(id);
-      recordNativeTelemetry('request_timeout', { id, method: message.method, timeoutMs: Number(timeoutMs || 12_000) });
+      recordNativeTelemetry('request_timeout', { id, method: message.method, timeoutMs: Number(timeoutMs || 12_000), elapsedMs: Date.now() - startedAt });
       reject(Object.assign(new Error(`native_request_timeout: ${method}`), {
         code: 'NATIVE_REQUEST_TIMEOUT',
         retryable: true,
         phase: 'native_messaging',
+        details: { method: message.method, timeoutMs: Number(timeoutMs || 12_000), elapsedMs: Date.now() - startedAt, attemptId: nativeStatus.currentAttempt?.id || '' },
       }));
     }, Number(timeoutMs || 12_000));
     pendingNativeRequests.set(id, {
       resolve: (value) => {
         clearTimeout(timer);
-        recordNativeTelemetry('request_succeeded', { id, method: message.method });
+        recordNativeTelemetry('request_succeeded', { id, method: message.method, elapsedMs: Date.now() - startedAt });
         resolve(value);
       },
       reject: (error) => {
         clearTimeout(timer);
-        recordNativeTelemetry('request_failed', { id, method: message.method, error: describeError(error) });
+        recordNativeTelemetry('request_failed', { id, method: message.method, error: describeError(error), elapsedMs: Date.now() - startedAt });
         reject(error);
       },
     });
     try {
       nativePort.postMessage(message);
+      recordNativeTelemetry('request_posted', { id, method: message.method });
     } catch (error) {
       pendingNativeRequests.delete(id);
       clearTimeout(timer);
-      recordNativeTelemetry('request_failed', { id, method: message.method, error: describeError(error) });
+      recordNativeTelemetry('request_failed', { id, method: message.method, error: describeError(error), elapsedMs: Date.now() - startedAt });
       reject(error);
     }
   });
@@ -548,6 +629,8 @@ async function performNativeReconnectAttempt(hostName = '') {
   if (nativePort) {
     try {
       const handshake = await requestNativeHost('ping', {}, NATIVE_HANDSHAKE_TIMEOUT_MS);
+      nativeStatus.handshakeReceivedAt = Date.now();
+      nativeStatus.handshake = handshake;
       assertNativeHostVersionCompatibility(handshake);
       const connectionState = classifyDesktopBridgeHandshake(handshake);
       if (connectionState === 'connected') {
@@ -578,6 +661,7 @@ async function performNativeReconnectAttempt(hostName = '') {
         nextRetryMs: BRIDGE_HEALTH_CHECK_DELAY_MS,
       });
     } catch (error) {
+      recordNativeFailure(error, 'health_check');
       if (nativePort) await disconnectNativeTransport('health_check_failed');
       await setNativeStatus('reconnecting', {
         error: describeError(error),
@@ -644,13 +728,19 @@ function isTargetNativeReconnectAlarm(name = '') {
 }
 
 async function setNativeStatus(state, patch = {}) {
+  if (state === 'connected') {
+    nativeStatus.firstFailure = null;
+    nativeStatus.lastFailure = null;
+    nativeStatus.lastConnectedAt = Date.now();
+    if (nativeStatus.currentAttempt) nativeStatus.currentAttempt.phase = 'connected';
+  }
   nativeStatus = {
     ...nativeStatus,
     ...patch,
     state,
     lastChecked: Date.now(),
     reconnectAttempt: nativeReconnectAttempt,
-    telemetry: nativeTelemetry.slice(-20),
+    telemetry: nativeTelemetry.slice(-NATIVE_TELEMETRY_LIMIT),
   };
   await persistNativeStatus();
   onStatusChange?.(getNativeStatus());
@@ -734,6 +824,20 @@ function nativeResponseError(error = {}) {
   return nativeError;
 }
 
+function recordNativeFailure(error, phase) {
+  const code = classifyNativeTransportFailure(error);
+  const failure = {
+    at: Date.now(),
+    code,
+    phase,
+    message: describeError(error).slice(0, 800),
+    attemptId: nativeStatus.currentAttempt?.id || '',
+  };
+  nativeStatus.firstFailure ||= failure;
+  nativeStatus.lastFailure = failure;
+  return code;
+}
+
 function recordNativeTelemetry(type, patch = {}) {
   const entry = {
     id: `native-telemetry-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
@@ -741,6 +845,9 @@ function recordNativeTelemetry(type, patch = {}) {
     kind: normalizeNativeTelemetryKind(type),
     hostName: patch.hostName || nativeStatus.hostName || NATIVE_HOST_DEFAULT,
     reconnectAttempt: nativeReconnectAttempt,
+    attemptId: nativeStatus.currentAttempt?.id || '',
+    elapsedMs: nativeStatus.currentAttempt ? Date.now() - nativeStatus.currentAttempt.startedAt : 0,
+    phase: nativeStatus.currentAttempt?.phase || '',
     at: Date.now(),
     ...patch,
   };
