@@ -12,6 +12,7 @@ import { NotificationsHost } from './notifications/NotificationsHost';
 import { useI18n } from './i18n';
 import { OfficialLoginGate } from './features/app-shell/OfficialLoginGate';
 import { AppSubjectsModal } from './features/app-shell/AppSubjectsModal';
+import { resolveAppAccess } from './features/app-shell/appAccess';
 import { StartupMigrationGate } from './features/app-shell/StartupMigrationGate';
 import { useExecutionPersistence } from './features/app-shell/useExecutionPersistence';
 import { useFeedbackReportDialog } from './features/app-shell/useFeedbackReportDialog';
@@ -40,6 +41,9 @@ const GenerationStudioPage = lazy(async () => ({ default: (await import('./pages
 const SubjectsPage = lazy(async () => ({ default: (await import('./pages/Subjects')).Subjects }));
 const AutomationPage = lazy(async () => ({ default: (await import('./pages/Automation')).Automation }));
 const ApprovalPage = lazy(async () => ({ default: (await import('./pages/Approval')).Approval }));
+
+// Temporary archive build switch: set true to restore the official-auth gate.
+const REQUIRE_OFFICIAL_AUTH_FOR_APP_ACCESS = false;
 
 function ViewLoadingFallback() {
   const { t } = useI18n();
@@ -380,18 +384,6 @@ function App() {
   const { snapshot: llmReadinessState, bootstrapped: llmReadinessBootstrapped } = useLlmReadinessState();
   const [appOnboardingOpen, setAppOnboardingOpen] = useState(false);
   const officialAuthStatus = String(officialAuthState?.status || '').trim();
-  const officialAuthPending = !officialAuthBootstrapped
-    || officialAuthStatus === 'restoring'
-    || officialAuthStatus === 'refreshing';
-  const officialAuthLoggedIn = officialAuthBootstrapped
-    && officialAuthStatus !== 'anonymous'
-    && officialAuthStatus !== 'reauthRequired'
-    && officialAuthStatus !== 'restoring'
-    && Boolean(officialAuthState?.loggedIn);
-  const officialAuthNeedsLogin = officialAuthBootstrapped
-    && !officialAuthPending
-    && !officialAuthLoggedIn;
-  const llmReadinessPending = officialAuthLoggedIn && !llmReadinessBootstrapped;
 
   const openAppOnboarding = useCallback(() => {
     setAppOnboardingOpen(true);
@@ -408,7 +400,21 @@ function App() {
     }
   }, []);
 
-  if (officialAuthPending) {
+  const officialAuthLoggedIn = officialAuthBootstrapped
+    && officialAuthStatus !== 'anonymous'
+    && officialAuthStatus !== 'reauthRequired'
+    && officialAuthStatus !== 'restoring'
+    && Boolean(officialAuthState?.loggedIn);
+  const accessTarget = resolveAppAccess({
+    requireOfficialAuth: REQUIRE_OFFICIAL_AUTH_FOR_APP_ACCESS,
+    officialAuthBootstrapped,
+    officialAuthStatus,
+    officialAuthLoggedIn,
+    llmReadinessBootstrapped,
+    llmReady: Boolean(llmReadinessState?.ready),
+  });
+
+  if (accessTarget === 'official-checking') {
     return (
       <>
         <OfficialLoginGate mode="checking" />
@@ -417,7 +423,16 @@ function App() {
     );
   }
 
-  if (officialAuthNeedsLogin) {
+  if (accessTarget === 'llm-checking') {
+    return (
+      <>
+        <OfficialLoginGate key="llm-checking" mode="checking" initialSetupTab="custom" customOnly />
+        <AppOnboarding open={appOnboardingOpen} onClose={closeAppOnboarding} />
+      </>
+    );
+  }
+
+  if (accessTarget === 'official-login') {
     return (
       <>
         <OfficialLoginGate mode={officialAuthStatus === 'reauthRequired' ? 'expired' : 'login'} />
@@ -426,19 +441,10 @@ function App() {
     );
   }
 
-  if (llmReadinessPending) {
+  if (accessTarget === 'llm-setup') {
     return (
       <>
-        <OfficialLoginGate mode="checking" />
-        <AppOnboarding open={appOnboardingOpen} onClose={closeAppOnboarding} />
-      </>
-    );
-  }
-
-  if (!llmReadinessState?.ready) {
-    return (
-      <>
-        <OfficialLoginGate mode={officialAuthStatus === 'reauthRequired' ? 'expired' : 'login'} />
+        <OfficialLoginGate key="llm-setup" mode="login" initialSetupTab="custom" customOnly />
         <AppOnboarding open={appOnboardingOpen} onClose={closeAppOnboarding} />
       </>
     );

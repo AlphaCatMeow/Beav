@@ -216,6 +216,7 @@ import {
   type McpServerConfig,
 } from './core/mcpStore';
 import { normalizeApiBaseUrl, normalizeRemoteAssetUrl, safeUrlJoin } from './core/urlUtils';
+import { buildCustomReadinessSnapshot, buildCustomSourceSettings } from './core/customLlmReadiness';
 import { resolveModelScopeFromContextType, resolveScopedModelName } from './core/modelScopeSettings';
 import {
   isPathWithinRoots,
@@ -3316,25 +3317,60 @@ ipcMain.handle('redbox-auth:product', async () => ({
   error: 'Official products are unavailable in the Electron archive',
 }));
 ipcMain.handle('redbox-auth:set-realm', async () => buildElectronArchiveAuthUnavailableResult());
-ipcMain.handle('llm-readiness:get-state', async () => ({
-  ready: false,
-  mode: 'custom',
-  reason: ELECTRON_ARCHIVE_AUTH_UNAVAILABLE,
-  officialLoggedIn: false,
-  canUseOfficial: false,
-  canUseCustom: true,
-  updatedAt: new Date().toISOString(),
-}));
-ipcMain.handle('llm-readiness:refresh', async () => ({
-  success: false,
-  ready: false,
-  reason: ELECTRON_ARCHIVE_AUTH_UNAVAILABLE,
-}));
-ipcMain.handle('llm-readiness:configure-custom-source', async () => ({
-  success: false,
-  ready: false,
-  reason: ELECTRON_ARCHIVE_AUTH_UNAVAILABLE,
-}));
+ipcMain.handle('llm-readiness:get-state', async () => (
+  buildCustomReadinessSnapshot((getSettings() || {}) as Record<string, unknown>)
+));
+ipcMain.handle('llm-readiness:refresh', async () => {
+  const snapshot = buildCustomReadinessSnapshot((getSettings() || {}) as Record<string, unknown>);
+  for (const targetWindow of BrowserWindow.getAllWindows()) {
+    targetWindow.webContents.send('llm-readiness:state-changed', snapshot);
+  }
+  return { success: true, ...snapshot };
+});
+ipcMain.handle('llm-readiness:configure-custom-source', async (_, payload?: {
+  baseURL?: string;
+  apiKey?: string;
+  presetId?: string;
+  protocol?: 'openai' | 'anthropic' | 'gemini';
+  preferredModel?: string;
+  name?: string;
+}) => {
+  try {
+    const { fetchModelsForAiSource } = await import('./core/aiSourceService');
+    const currentSettings = (getSettings() || {}) as Record<string, unknown>;
+    const { protocol, models } = await fetchModelsForAiSource({
+      baseURL: payload?.baseURL || '',
+      apiKey: payload?.apiKey || '',
+      presetId: payload?.presetId,
+      protocol: payload?.protocol,
+      purpose: 'chat',
+    });
+    const custom = buildCustomSourceSettings(currentSettings, { ...payload, protocol }, models);
+    saveSettings(
+      normalizeSettingsInput(custom.settings) as Parameters<typeof saveSettings>[0]
+    );
+    broadcastSettingsUpdated();
+
+    const snapshot = buildCustomReadinessSnapshot((getSettings() || {}) as Record<string, unknown>);
+    for (const targetWindow of BrowserWindow.getAllWindows()) {
+      targetWindow.webContents.send('llm-readiness:state-changed', snapshot);
+    }
+    return {
+      success: true,
+      source: custom.source,
+      models,
+      readiness: snapshot,
+      ...snapshot,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      ready: false,
+      reason: 'custom-source-configuration-failed',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
 
 function getSenderWindow(event: IpcMainInvokeEvent): BrowserWindow | null {
   return BrowserWindow.fromWebContents(event.sender) || win || null;

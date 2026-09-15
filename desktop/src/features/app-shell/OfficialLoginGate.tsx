@@ -123,9 +123,17 @@ async function buildWechatQrDataUrl(value: string): Promise<string> {
   });
 }
 
-export function OfficialLoginGate({ mode }: { mode: OfficialAuthGateMode }) {
+export function OfficialLoginGate({
+  mode,
+  initialSetupTab = 'official',
+  customOnly = false,
+}: {
+  mode: OfficialAuthGateMode;
+  initialSetupTab?: LlmSetupTab;
+  customOnly?: boolean;
+}) {
   const [activeRealm, setActiveRealm] = useState<OfficialAuthRealm>('cn');
-  const [activeSetupTab, setActiveSetupTab] = useState<LlmSetupTab>('official');
+  const [activeSetupTab, setActiveSetupTab] = useState<LlmSetupTab>(initialSetupTab);
   const [smsBusy, setSmsBusy] = useState(false);
   const [smsForm, setSmsForm] = useState({ phone: '', code: '', inviteCode: '' });
   const [customBusy, setCustomBusy] = useState(false);
@@ -381,10 +389,14 @@ export function OfficialLoginGate({ mode }: { mode: OfficialAuthGateMode }) {
   const isMainlandRealm = activeRealm === 'cn';
   const authBusy = wechatBusy || smsBusy || customBusy;
   const showMainlandWechatQr = isMainlandRealm && Boolean(wechatQrUrl);
-  const title = mode === 'checking'
+  const title = customOnly
+    ? 'Configure AI'
+    : mode === 'checking'
     ? 'Checking session'
     : 'Welcome back';
-  const subtitle = mode === 'checking'
+  const subtitle = customOnly
+    ? `Connect your own model service to ${APP_BRAND.displayName}.`
+    : mode === 'checking'
     ? `Restoring ${APP_BRAND.displayName}.`
     : mode === 'expired'
       ? 'Your session expired. Log in or use your own API to continue.'
@@ -427,7 +439,7 @@ export function OfficialLoginGate({ mode }: { mode: OfficialAuthGateMode }) {
               {mode === 'checking' ? (
                 <div className="flex h-52 items-center justify-center rounded-2xl border border-slate-200/80 bg-white/70 text-slate-500 shadow-sm">
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  正在恢复账号
+                  {customOnly ? '正在检查模型配置' : '正在恢复账号'}
                 </div>
               ) : (
                 <div className="space-y-5">
@@ -478,17 +490,19 @@ export function OfficialLoginGate({ mode }: { mode: OfficialAuthGateMode }) {
                       >
                         {customBusy ? <Loader2 className="mx-auto h-4 w-4 animate-spin" /> : '继续'}
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveSetupTab('official');
-                          setLoginNotice('idle', '');
-                        }}
-                        disabled={authBusy}
-                        className="flex h-[56px] w-full items-center justify-center rounded-xl border border-slate-200/80 bg-white/80 text-base font-medium text-slate-600 shadow-[0_10px_34px_rgba(15,23,42,0.04)] transition hover:bg-white disabled:opacity-60"
-                      >
-                        返回登陆
-                      </button>
+                      {!customOnly && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveSetupTab('official');
+                            setLoginNotice('idle', '');
+                          }}
+                          disabled={authBusy}
+                          className="flex h-[56px] w-full items-center justify-center rounded-xl border border-slate-200/80 bg-white/80 text-base font-medium text-slate-600 shadow-[0_10px_34px_rgba(15,23,42,0.04)] transition hover:bg-white disabled:opacity-60"
+                        >
+                          返回登陆
+                        </button>
+                      )}
                     </form>
                   ) : showMainlandWechatQr ? (
                     <div className="space-y-5">

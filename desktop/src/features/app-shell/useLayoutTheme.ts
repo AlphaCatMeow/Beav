@@ -28,6 +28,15 @@ function subscribeToSystemThemeChange(listener: () => void): () => void {
   return () => mediaQuery.removeListener(listener);
 }
 
+function isTauriRuntime(): boolean {
+  if (typeof window === 'undefined') return false;
+  const tauriWindow = window as typeof window & {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  };
+  return Boolean(tauriWindow.__TAURI_INTERNALS__ || tauriWindow.__TAURI__);
+}
+
 export function useLayoutTheme(immersiveMode: ImmersiveMode): {
   themeMode: ThemeMode;
   setManualThemeMode: Dispatch<SetStateAction<ThemeMode>>;
@@ -54,6 +63,7 @@ export function useLayoutTheme(immersiveMode: ImmersiveMode): {
     const effectiveTheme = immersiveMode === 'dark' ? 'dark' : themeMode;
     const windowTheme = immersiveMode === 'dark' ? effectiveTheme : themePreference === 'system' ? null : effectiveTheme;
     applyAppTheme(effectiveTheme);
+    if (!isTauriRuntime()) return;
     void getCurrentWindow().setTheme(windowTheme).catch((error) => {
       console.warn(`[${APP_BRAND.displayName}] failed to apply window theme:`, error);
     });
