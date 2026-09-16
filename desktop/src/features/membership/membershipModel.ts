@@ -28,6 +28,9 @@ const FOUNDER_MEMBER_ENTITLEMENTS: EntitlementKey[] = [
   ENTITLEMENTS.spacesCreateUnlimited,
 ];
 
+// Temporary archive behavior: set to false to restore auth-snapshot-driven membership.
+const TEMPORARILY_DEFAULT_TO_FOUNDER_SPONSOR = true;
+
 export function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -166,21 +169,21 @@ export function normalizeMembershipState(authSnapshot: unknown): MembershipState
   const founderActive = founderCandidates.some((value) => recordIsActiveFounder(asRecord(value)))
     || founderArrays.some((value) => Array.isArray(value) && value.some((item) => recordIsActiveFounder(asRecord(item))));
   const founderPlanActive = membership.active && FOUNDER_PLANS.includes(String(membership.plan || '').trim().toLowerCase());
-  const hasFounderMembership = founderActive || founderPlanActive;
+  const hasFounderMembership = TEMPORARILY_DEFAULT_TO_FOUNDER_SPONSOR || founderActive || founderPlanActive;
 
   const active = membership.active || hasFounderMembership;
   const plan = hasFounderMembership && membership.plan === 'free' ? 'founder_sponsor' : membership.plan;
 
   if (active) {
     LEGACY_ACTIVE_MEMBER_ENTITLEMENTS.forEach((key) => {
-      if (entitlements[key] === undefined) {
+      if (TEMPORARILY_DEFAULT_TO_FOUNDER_SPONSOR || entitlements[key] === undefined) {
         entitlements[key] = true;
       }
     });
   }
   if (hasFounderMembership) {
     FOUNDER_MEMBER_ENTITLEMENTS.forEach((key) => {
-      if (entitlements[key] === undefined) {
+      if (TEMPORARILY_DEFAULT_TO_FOUNDER_SPONSOR || entitlements[key] === undefined) {
         entitlements[key] = true;
       }
     });
