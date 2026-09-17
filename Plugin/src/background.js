@@ -3777,6 +3777,7 @@ function buildDouyinEntry(payload) {
     assets: {
       coverUrl: coverUrl || undefined,
       videoUrl: videoAssetUrl || undefined,
+      videoUrls: Array.isArray(payload?.videoUrls) ? payload.videoUrls : [],
     },
     options: {
       dedupeKey: stableNoteId,
@@ -6595,7 +6596,7 @@ async function saveDouyinVideoFromTab(tabId) {
     source: payload?.source || '',
     title: payload?.title || '',
     hasCoverUrl: Boolean(payload?.coverUrl || payload?.coverDataUrl),
-    videoUrl: String(payload?.videoUrl || ''),
+    ...payload?.captureDiagnostics,
     hasVideoDataUrl: Boolean(payload?.videoDataUrl),
   });
   const response = await postKnowledgeEntry(buildDouyinEntry(payload));

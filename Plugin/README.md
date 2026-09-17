@@ -130,9 +130,11 @@ pnpm package
 
 在抖音打开目标作品，播放后使用 Popup 或侧边栏的“保存抖音视频到知识库”。支持视频详情页和精选等列表中的视频弹窗。保存时请停留在该作品；识别不到完整视频或页面已经切换时，会提示重试。
 
-`src/capture/douyinCapture.js` 是 `save-douyin` 共用的 MAIN-world extractor，内部自包含，以便 `chrome.scripting.executeScript` 序列化注入。按 URL / 当前可见播放器的作品 ID 匹配播放器 React props 或 `RENDER_DATA`，标题、作者、封面、统计和媒体均属于该作品。完整 MP4 优先，排除 DASH 独立音视频轨；不再从全页 script / performance 请求中猜媒体地址。无法读取的 MediaSource `blob:` 不会传给桌面下载。桌面 `knowledge.rs::download_note_asset_bytes_once` 为 `douyinvod.com` 及其子域的媒体请求补上抖音来源头，防止 CDN 返回 403；仍沿用现有公共地址校验、大小限制、原子落盘和失败状态。
+`src/capture/douyinCapture.js` 是 `save-douyin` 共用的 MAIN-world extractor，内部自包含，以便 `chrome.scripting.executeScript` 序列化注入。按 URL / 当前可见播放器的作品 ID 匹配播放器 React props 或 `RENDER_DATA`，标题、作者、封面、统计和媒体均属于该作品。完整 MP4 优先，排除 DASH 独立音视频轨；不再从全页 script / performance 请求中猜媒体地址。无法读取的 MediaSource `blob:` 不会传给桌面下载。详情页支持 `video_<作品 ID>` 容器。保存时在原页面会话内探测该作品的 `playApi`（最多两个完整 MP4 播放入口、共享 8 秒超时、Range 小请求并取消响应体），优先使用返回的新签名视频 URL；其他完整来源通过已有 `assets.videoUrls` 保留。桌面 `knowledge.rs::spawn_note_asset_processing` 在主来源失败后尝试备用来源，所有来源失败后才写失败状态，暂时性失败沿用既有重试次数；`download_note_asset_bytes_once` 继续为抖音 CDN 补来源头并执行公共地址校验、大小限制和原子落盘。
 
-`pnpm test:douyin-capture` 覆盖预加载广告、作品 ID 匹配、两种数据格式、完整视频筛选及 SPA 切换。后台控制台的 `[redbox-plugin][douyin] payload` 包含三个作品 ID、数据来源、候选数量、媒体域名与时长，不打印带签名的媒体地址。修改后需构建 `dist/extension` 并重新加载扩展；商店安装版需要更新包才会包含修复；桌面端也需运行包含来源头修复的版本，单独重载插件不会更新桌面下载器。
+首页信息流保存以当前 `feed-active-video` 作品容器为准，`feed-video` 预加载容器不参与选取；可见详情弹层优先于背后的信息流。多个同级作品同时可见时拒绝猜测。播放数据只从所选播放器的 React props、hook/ref 状态或 `RENDER_DATA` 按完整作品 ID 查找；同 ID 的不完整数据对象不会阻断后续查找。首页的 `RENDER_DATA` 可能只有应用配置，不包含动态加载的作品。异步读取播放地址和封面后重新选择活动播放器，避免首页地址不变、旧 video 节点仍保留时保存上一条。`captureDiagnostics.playerSelection` 和 `dataSource` 记录选取标记及数据来源。
+
+`pnpm test:douyin-capture` 覆盖预加载广告、作品 ID 匹配、两种数据格式、完整视频筛选、签名地址解析与响应体释放、备用来源保留、详情页 ID 及异步解析期间的 SPA 切换。后台控制台的 `[redbox-plugin][douyin] payload` 包含三个作品 ID、数据来源、候选数量、媒体域名与时长，不打印带签名的媒体地址。修改后需构建 `dist/extension` 并重新加载扩展；商店安装版需要更新包才会包含修复；桌面端也需运行包含备用来源修复的版本，单独重载插件不会更新桌面下载器。
 
 ## 使用方式
 
