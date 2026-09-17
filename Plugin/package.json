@@ -14,6 +14,7 @@
     "check": "pnpm build && pnpm verify && pnpm typecheck && pnpm test:desktop-bridge-client && pnpm test:site-research && pnpm test:generic-capture && pnpm test:douyin-capture && pnpm test:plugin-diagnostics && pnpm test:native-connection-diagnostics",
     "install:native-host": "node install-native-host.mjs",
     "diagnose:browser-control": "node scripts/diagnose-browser-control.mjs",
+    "test:browser-action-correctness": "node scripts/test-browser-action-correctness.mjs",
     "test:browser-control-faults": "node scripts/test-browser-control-faults.mjs",
     "test:browser-control-binding": "node scripts/test-browser-control-binding.mjs",
     "test:browser-session-kernel": "node scripts/test-browser-session-kernel.mjs",

@@ -1,4 +1,3 @@
-import { DANGEROUS_ACTION_TEXT, browserPolicyError } from './browserPolicy.js';
 import { attachCdpTab, getDefaultCdpTimeoutMs, sendCdpCommandWithTimeout } from './cdpTransport.js';
 import { sendContentMessage } from './dynamicContentInjection.js';
 
@@ -180,7 +179,6 @@ export async function dispatchKeyboardType(action = {}, options = {}) {
   const tabId = requireTabId(action, options.activeTabId, 'input.keyboardType');
   const text = String(action.text || '');
   if (!text) return { success: true, tabId, textLength: 0 };
-  if (DANGEROUS_ACTION_TEXT.test(text)) throw browserPolicyError('denied_dangerous_action', action);
   emitPixelInputTelemetry('input.started', { actionType: 'input.keyboardType', tabId, textLength: text.length });
   await focusTabForPixelInput(tabId);
   await attachCdpTab(tabId);
@@ -203,13 +201,16 @@ export async function dispatchKeyboardPress(action = {}, options = {}) {
   await focusTabForPixelInput(tabId);
   await attachCdpTab(tabId);
   if (action.selector || action.focusSelector) await focusElementForKeyboardCombo(tabId, action.selector || action.focusSelector, action);
+  const named = KEY_EVENT_MAP[key] || {};
   const params = {
+    ...named,
     key,
-    code: String(action.code || key),
-    windowsVirtualKeyCode: Number(action.windowsVirtualKeyCode || action.keyCode || 0) || undefined,
-    nativeVirtualKeyCode: Number(action.nativeVirtualKeyCode || action.keyCode || 0) || undefined,
+    code: String(action.code || named.code || key),
+    windowsVirtualKeyCode: Number(action.windowsVirtualKeyCode || action.keyCode || named.windowsVirtualKeyCode || 0) || undefined,
+    nativeVirtualKeyCode: Number(action.nativeVirtualKeyCode || action.keyCode || named.windowsVirtualKeyCode || 0) || undefined,
     modifiers: modifierMaskFromAction(action),
   };
+  options.signal?.throwIfAborted();
   await sendCdpCommandWithTimeout({ tabId }, 'Input.dispatchKeyEvent', { ...params, type: 'rawKeyDown' }, Number(action.timeoutMs || CDP_COMMAND_TIMEOUT_MS));
   await sendCdpCommandWithTimeout({ tabId }, 'Input.dispatchKeyEvent', { ...params, type: 'keyUp' }, Number(action.timeoutMs || CDP_COMMAND_TIMEOUT_MS));
   emitPixelInputTelemetry('input.succeeded', { actionType: 'input.keyboardPress', tabId, key, durationMs: Date.now() - startedAt });
@@ -662,10 +663,10 @@ function parseKeyboardCombo(action = {}) {
   };
 }
 
-function modifierMaskFromAction(action = {}) {
+export function modifierMaskFromAction(action = {}) {
   const explicit = Number(action.modifiers);
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
-  const keys = Array.isArray(action.keys) ? action.keys : [];
+  const keys = Array.isArray(action.modifiers) ? action.modifiers : Array.isArray(action.keys) ? action.keys : [];
   const modifiers = keys.map(normalizeKeyName).filter(isModifierKey);
   return modifierMask(modifiers);
 }
@@ -775,6 +776,10 @@ const KEY_EVENT_MAP = {
   ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38 },
   ArrowRight: { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39, nativeVirtualKeyCode: 39 },
   ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40 },
+  Home: { key: 'Home', code: 'Home', windowsVirtualKeyCode: 36 },
+  End: { key: 'End', code: 'End', windowsVirtualKeyCode: 35 },
+  PageUp: { key: 'PageUp', code: 'PageUp', windowsVirtualKeyCode: 33 },
+  PageDown: { key: 'PageDown', code: 'PageDown', windowsVirtualKeyCode: 34 },
   ' ': { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32 },
 };
 

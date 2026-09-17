@@ -10,6 +10,7 @@ export function configureDynamicContentInjectionTelemetry(publisher) {
 }
 
 export async function sendContentMessage(tabId, type, options = {}, frameId = 0, delivery = {}) {
+  delivery.signal?.throwIfAborted();
   const id = Number(tabId);
   const targetFrameId = Number(frameId || 0);
   const startedAt = Date.now();
@@ -57,8 +58,13 @@ export async function sendContentMessage(tabId, type, options = {}, frameId = 0,
       },
     };
   }
+  delivery.signal?.throwIfAborted();
+  const requestId = crypto.randomUUID();
+  const cancel = () => { void chrome.tabs.sendMessage(id, { type: 'xwow-data-ai:cancel-request', requestId }, { frameId: targetFrameId }).catch(() => {}); };
+  delivery.signal?.addEventListener('abort', cancel, { once: true });
   const sendPromise = chrome.tabs.sendMessage(id, {
     type,
+    requestId,
     options,
   }, { frameId: targetFrameId }).catch((error) => ({ success: false, error: describeChromeError(error) }));
   await publishContentInjectionEvent('message.sent', {
@@ -67,7 +73,9 @@ export async function sendContentMessage(tabId, type, options = {}, frameId = 0,
     messageType: type,
     prepared,
   });
-  const response = await sendPromise;
+  let response;
+  try { response = await sendPromise; }
+  finally { delivery.signal?.removeEventListener('abort', cancel); }
   const eventKind = response?.success === true ? 'message.completed' : 'message.failed';
   await publishContentInjectionEvent(eventKind, {
     tabId: id,
