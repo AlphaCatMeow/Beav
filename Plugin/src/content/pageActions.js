@@ -1,11 +1,11 @@
-import { cssPath, normalizeWhitespace, sleep } from './domUtils.js';
+import { documentIdentity, cssPath, normalizeWhitespace, sleep } from './domUtils.js';
 
-const DANGEROUS_ACTION_TEXT = /(save|submit|publish|delete|remove|refund|cancel order|ship order|change price|change inventory|change budget|enable ad|disable ad|保存|提交|发布|删除|移除|退款|取消订单|发货|改价|库存|预算|开启广告|关闭广告)/i;
 const nodeIds = new WeakMap();
 const nodesById = new Map();
 let nextNodeId = 1;
 
 export async function scrollPage(options) {
+  assertDocument(options);
   const maxSteps = Number(options.maxSteps || 8);
   const delayMs = Number(options.delayMs || 450);
   const direction = String(options.direction || 'down').toLowerCase();
@@ -14,9 +14,9 @@ export async function scrollPage(options) {
   const scrollY = Number(options.scrollY ?? options.scroll_y ?? 0);
   const scrollTarget = document.scrollingElement || document.documentElement;
   const before = pageScrollSnapshot(scrollTarget);
-  if (scrollX || scrollY) {
+  if ('scrollX' in options || 'scrollY' in options || 'scroll_x' in options || 'scroll_y' in options) {
     scrollTarget.scrollBy({ left: scrollX, top: scrollY, behavior: options.behavior || 'auto' });
-    await sleep(Number(options.delayMs || options.waitAfterScrollMs || 80));
+    await actionDelay(Number(options.delayMs || options.waitAfterScrollMs || 80), options);
     return {
       success: true,
       mode: 'target-delta',
@@ -44,7 +44,7 @@ export async function scrollPage(options) {
           ? scroller.scrollTop + explicitPixels
           : scroller.scrollHeight;
     }
-    await sleep(delayMs);
+    await actionDelay(delayMs, options);
     const nextHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
     if (nextHeight === previousHeight && window.scrollY + window.innerHeight >= nextHeight - 12) break;
     previousHeight = nextHeight;
@@ -81,7 +81,7 @@ export async function clickNextButton(options) {
     });
   if (!byText) return { success: false, error: 'Next button not found' };
   byText.scrollIntoView({ block: 'center', inline: 'center' });
-  await sleep(180);
+  await actionDelay(180, options);
   byText.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
   byText.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
   byText.click();
@@ -92,14 +92,34 @@ export async function clickElement(options) {
   const target = findClickTarget(options);
   if (!target) return { success: false, error: 'Clickable element not found' };
   const label = elementLabel(target);
-  if (isDangerousElement(target, label) && options.force !== true) {
-    return { success: false, error: 'dangerous_action_denied', selector: cssPath(target), text: label };
-  }
   target.scrollIntoView({ block: 'center', inline: 'center' });
-  await sleep(Number(options.beforeClickDelayMs || 160));
+  await actionDelay(Number(options.beforeClickDelayMs || 160), options);
+  const point = assertActionTarget(target, options);
+  if (options.prepareOnly === true) {
+    const rect = target.getBoundingClientRect();
+    let x = point.x;
+    let y = point.y;
+    let frame = window;
+    try {
+      while (frame !== frame.top) {
+        const owner = frame.frameElement;
+        if (!owner) throw new Error('cross_origin_frame');
+        const bounds = owner.getBoundingClientRect();
+        if (frame.parent.getComputedStyle(owner).transform !== 'none' || Math.abs(bounds.width - owner.offsetWidth) > 1 || Math.abs(bounds.height - owner.offsetHeight) > 1) throw new Error('transformed_frame');
+        x += bounds.left + owner.clientLeft;
+        y += bounds.top + owner.clientTop;
+        frame = frame.parent;
+        const hit = frame.document.elementFromPoint(x, y);
+        if (hit !== owner) throw new Error('frame_obscured');
+      }
+    } catch { throw new Error('browser_input_frame_unavailable: use explicit inputMode=dom or select a supported frame'); }
+    return { success: true, documentId: documentIdentity, selector: cssPath(target), text: label, x, y };
+  }
   dispatchElementClick(target, options);
   return {
     success: true,
+    outcome: 'events_dispatched',
+    inputMode: 'dom',
     selector: cssPath(target),
     locator: locatorReceipt(options, target),
     text: label,
@@ -115,7 +135,8 @@ export async function hoverElement(options) {
   if (!target) return { success: false, error: 'Hover element not found' };
   const label = elementLabel(target);
   target.scrollIntoView({ block: 'center', inline: 'center' });
-  await sleep(Number(options.beforeHoverDelayMs || 120));
+  await actionDelay(Number(options.beforeHoverDelayMs || 120), options);
+  assertActionTarget(target, options);
   const rect = target.getBoundingClientRect();
   const x = rect.left + rect.width / 2;
   const y = rect.top + rect.height / 2;
@@ -128,6 +149,8 @@ export async function hoverElement(options) {
   if (options.focus === true && typeof target.focus === 'function') target.focus();
   return {
     success: true,
+    outcome: 'events_dispatched',
+    inputMode: 'dom',
     selector: cssPath(target),
     locator: locatorReceipt(options, target),
     text: label,
@@ -145,14 +168,12 @@ export async function typeElement(options) {
   if (!target) return { success: false, error: 'Input element not found' };
   const label = elementLabel(target);
   const text = normalizeTypeValue(options);
-  if ((isDangerousElement(target, label) && options.force !== true) || DANGEROUS_ACTION_TEXT.test(text)) {
-    return { success: false, error: 'dangerous_action_denied', selector: cssPath(target), text: label };
-  }
   const previousValue = readElementTextValue(target);
   const replace = normalizeTypeReplace(options);
   const nextValue = replace ? text : `${previousValue}${text}`;
   target.scrollIntoView({ block: 'center', inline: 'center' });
-  await sleep(Number(options.beforeTypeDelayMs || 120));
+  await actionDelay(Number(options.beforeTypeDelayMs || 120), options);
+  assertActionTarget(target, options);
   target.focus();
   if (replace) {
     setInputValue(target, '');
@@ -161,12 +182,15 @@ export async function typeElement(options) {
   target.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: replace ? 'insertReplacementText' : 'insertText', data: text }));
   target.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
   return {
-    success: true,
+    success: target.isConnected && readElementTextValue(target) === nextValue,
+    error: target.isConnected && readElementTextValue(target) === nextValue ? undefined : 'input_value_not_applied',
     selector: cssPath(target),
     locator: locatorReceipt(options, target),
     textLength: text.length,
     label,
-    value: nextValue,
+    value: readElementTextValue(target),
+    requestedValue: nextValue,
+    applied: target.isConnected && readElementTextValue(target) === nextValue,
     previousValue,
     replace,
   };
@@ -176,14 +200,12 @@ export async function selectElement(options) {
   const target = findSelectTarget(options);
   if (!target) return { success: false, error: 'Select element not found' };
   const label = elementLabel(target);
-  if (isDangerousElement(target, label)) {
-    return { success: false, error: 'dangerous_action_denied', selector: cssPath(target), text: label };
-  }
   const selections = normalizeSelectSelections(options);
   const selectedOptions = selections.map((selection) => findSelectOption(target, selection)).filter(Boolean);
   if (!selectedOptions.length) return { success: false, error: 'Select option not found', selector: cssPath(target), text: label };
   target.scrollIntoView({ block: 'center', inline: 'center' });
-  await sleep(Number(options.beforeSelectDelayMs || 120));
+  await actionDelay(Number(options.beforeSelectDelayMs || 120), options);
+  assertActionTarget(target, options);
   target.focus();
   if (target.multiple) {
     const selected = new Set(selectedOptions.map((option) => option.value));
@@ -196,13 +218,15 @@ export async function selectElement(options) {
   const selectedValues = [...target.selectedOptions].map((option) => option.value);
   target.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertReplacementText', data: selectedValues.join(',') }));
   target.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+  const applied = target.isConnected && selectedOptions.every((option) => option.selected);
   return {
-    success: true,
+    success: applied,
+    error: applied ? undefined : 'selection_not_applied',
     selector: cssPath(target),
     locator: locatorReceipt(options, target),
     label,
     value: target.value,
-    values: selectedValues,
+    values: [...target.selectedOptions].map((option) => option.value),
     selectedIndex: target.selectedIndex,
     selectedText: [...target.selectedOptions].map((option) => normalizeWhitespace(option.textContent || option.label || '')).join(','),
     selections: selectedOptions.map((option) => ({
@@ -220,12 +244,10 @@ export async function checkElement(options = {}) {
   if (!isCheckableInput(target)) {
     return { success: false, error: 'Element is not checkbox or radio input', selector: cssPath(target), text: label };
   }
-  if (isDangerousElement(target, label) && options.force !== true) {
-    return { success: false, error: 'dangerous_action_denied', selector: cssPath(target), text: label };
-  }
   const desired = normalizeCheckedValue(options);
   target.scrollIntoView({ block: 'center', inline: 'center' });
-  await sleep(Number(options.beforeCheckDelayMs || 120));
+  await actionDelay(Number(options.beforeCheckDelayMs || 120), options);
+  assertActionTarget(target, options);
   target.focus();
   if (target.checked !== desired) {
     setCheckedValue(target, desired);
@@ -233,7 +255,8 @@ export async function checkElement(options = {}) {
     target.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
   }
   return {
-    success: true,
+    success: target.isConnected && target.checked === desired,
+    error: target.isConnected && target.checked === desired ? undefined : 'checked_state_not_applied',
     selector: cssPath(target),
     locator: locatorReceipt(options, target),
     label,
@@ -405,11 +428,9 @@ export async function clickNode(options = {}) {
   const target = findNodeById(options);
   if (!target) return { success: false, error: 'Node not found', nodeId: normalizeNodeId(options) };
   const label = elementLabel(target);
-  if (isDangerousElement(target, label) && options.force !== true) {
-    return { success: false, error: 'dangerous_action_denied', nodeId: getNodeId(target), selector: cssPath(target), text: label };
-  }
   target.scrollIntoView({ block: 'center', inline: 'center' });
-  await sleep(Number(options.beforeClickDelayMs || 120));
+  await actionDelay(Number(options.beforeClickDelayMs || 120), options);
+  assertActionTarget(target, options);
   dispatchElementClick(target, options);
   return {
     success: true,
@@ -427,7 +448,7 @@ export function scrollNode(options = {}) {
   const scrollY = Number(options.scrollY ?? options.scroll_y ?? 0);
   if (nodeId && !target) return { success: false, error: 'Node not found', nodeId };
   const scrollTarget = target || document.scrollingElement || document.documentElement;
-  if (scrollX || scrollY) {
+  if ('scrollX' in options || 'scrollY' in options || 'scroll_x' in options || 'scroll_y' in options) {
     scrollTarget.scrollBy({ left: scrollX, top: scrollY, behavior: options.behavior || 'auto' });
   } else if (target) {
     target.scrollIntoView({ block: options.block || 'center', inline: options.inline || 'center' });
@@ -457,7 +478,7 @@ export async function waitForNode(options = {}) {
         element: elementDescriptor(target),
       };
     }
-    await sleep(100);
+    await actionDelay(100, options);
   }
   return {
     success: false,
@@ -490,7 +511,7 @@ export async function waitForSelector(options = {}) {
         element: node ? elementDescriptor(node) : null,
       };
     }
-    await sleep(100);
+    await actionDelay(100, options);
   }
   return {
     success: false,
@@ -528,7 +549,7 @@ export async function waitForDomStable(options) {
           scrollHeight: document.documentElement.scrollHeight,
         };
       }
-      await sleep(100);
+      await actionDelay(100, options);
     }
     return {
       success: false,
@@ -562,7 +583,7 @@ async function waitForInputTarget(options = {}) {
   while (Date.now() - startedAt <= timeoutMs) {
     const target = findInputTarget(options);
     if (target) return target;
-    await sleep(100);
+    await actionDelay(100, options);
   }
   return null;
 }
@@ -646,7 +667,7 @@ function findHoverTarget(options) {
 }
 
 function findInputTarget(options) {
-  const locatorTarget = resolveLocatorActionTarget(options, (node) => isInputLike(node) && isClickable(node));
+  const locatorTarget = resolveLocatorActionTarget({ ...options, text: undefined }, (node) => isInputLike(node) && isClickable(node));
   if (locatorTarget !== undefined) return locatorTarget;
   if (options.selector) {
     const bySelector = [...document.querySelectorAll(options.selector)]
@@ -781,8 +802,18 @@ const LOCATOR_AST_MAX_DEPTH = 16;
 const LOCATOR_AST_MAX_NODES = 5_000;
 
 function resolveLocatorActionTarget(options = {}, predicate) {
-  if (!isObject(options.locatorAst)) return undefined;
-  const nodes = resolveLocatorAst(options.locatorAst).filter((node) => predicate(node));
+  assertDocument(options);
+  let ast = options.locatorAst;
+  if (!isObject(ast)) {
+    if (options.selector) ast = { kind: 'css', selector: options.selector };
+    else if (options.role) ast = { kind: 'role', role: options.role, name: options.text || options.label, exact: true };
+    else if (options.placeholder) ast = { kind: 'placeholder', placeholder: options.placeholder, exact: true };
+    else if (options.label || options.textLabel) ast = { kind: 'label', text: options.label || options.textLabel, exact: true };
+    else if (options.text) ast = { kind: 'text', text: options.text, exact: true };
+    else return undefined;
+  }
+  const nodes = resolveLocatorAst(ast).filter((node) => predicate(node));
+  if (!nodes.length) return null;
   const selected = selectLocatorNodes(nodes, { ...options, all: false, multiple: false, mode: '' });
   return selected[0] || null;
 }
@@ -795,7 +826,8 @@ function selectLocatorNodes(nodes, options = {}) {
   if (options.last === true) return bounded.length ? [bounded[bounded.length - 1]] : [];
   if (options.all === true || options.multiple === true || options.mode === 'all' || options.mode === 'count') return bounded;
   if (options.strict !== false && bounded.length !== 1) {
-    throw new Error(`locator_strict_mode_violation: expected 1 element, found ${bounded.length}`);
+    const candidates = bounded.slice(0, 5).map((node) => ({ selector: cssPath(node), role: node.getAttribute('role') || implicitRole(node), text: elementLabel(node).slice(0, 120) }));
+    throw new Error(`locator_strict_mode_violation: expected 1 element, found ${bounded.length}; candidates=${JSON.stringify(candidates)}`);
   }
   return bounded[0] ? [bounded[0]] : [];
 }
@@ -941,6 +973,7 @@ function locatorReceipt(options = {}, node) {
   if (!isObject(options.locatorAst) || !(node instanceof Element)) return null;
   return {
     kind: 'locator_receipt',
+    documentId: documentIdentity,
     nodeId: getNodeId(node),
     selector: cssPath(node),
     matchedAt: new Date().toISOString(),
@@ -1017,6 +1050,7 @@ function readElementValues(node) {
 
 function elementReadSnapshot(node) {
   return {
+    documentId: documentIdentity,
     nodeId: getNodeId(node),
     attributes: Object.fromEntries([...node.attributes || []].map((attr) => [attr.name, attr.value])),
     inner_text: normalizeWhitespace(node.innerText || ''),
@@ -1073,25 +1107,12 @@ function elementLabel(node) {
   );
 }
 
-function isDangerousElement(node, label = '') {
-  const text = [
-    label,
-    node.getAttribute?.('aria-label') || '',
-    node.getAttribute?.('title') || '',
-    node.getAttribute?.('data-testid') || '',
-    node.getAttribute?.('class') || '',
-    node.getAttribute?.('id') || '',
-    node.getAttribute?.('type') || '',
-  ].join(' ');
-  return DANGEROUS_ACTION_TEXT.test(text);
-}
-
 function isClickable(node) {
-  if (!node) return false;
+  if (!node || !node.isConnected) return false;
   const rect = node.getBoundingClientRect();
   const style = window.getComputedStyle(node);
   const disabled = node.disabled || node.getAttribute('aria-disabled') === 'true';
-  return !disabled && rect.width > 4 && rect.height > 4 && style.display !== 'none' && style.visibility !== 'hidden';
+  return !disabled && rect.width > 4 && rect.height > 4 && style.display !== 'none' && style.visibility !== 'hidden' && style.pointerEvents !== 'none';
 }
 
 function isHoverable(node) {
@@ -1130,6 +1151,7 @@ function elementDescriptor(node) {
   const ariaName = node.getAttribute('aria-label') || node.getAttribute('title') || node.getAttribute('alt') || null;
   const testId = node.getAttribute('data-testid') || node.getAttribute('data-test') || node.getAttribute('data-test-id') || null;
   return {
+    documentId: documentIdentity,
     nodeId: getNodeId(node),
     tagName: node.tagName.toLowerCase(),
     role: node.getAttribute('role') || implicitRole(node) || null,
@@ -1163,6 +1185,7 @@ function getNodeId(node) {
 }
 
 function findNodeById(options = {}) {
+  assertDocument(options);
   const nodeId = normalizeNodeId(options);
   if (!nodeId) return null;
   const node = nodesById.get(nodeId);
@@ -1336,4 +1359,43 @@ function scrollableContainers() {
       return /(auto|scroll)/.test(`${style.overflow}${style.overflowY}`) && node.scrollHeight > node.clientHeight + 120;
     })
     .slice(0, 20);
+}
+
+function assertDocument(options = {}) {
+  options.assertActive?.();
+  if (options.documentId && options.documentId !== documentIdentity) throw new Error('stale_document: inspect the current document again');
+}
+
+async function actionDelay(ms, options = {}) {
+  assertDocument(options);
+  if (!options.signal) await sleep(ms);
+  else await new Promise((resolve, reject) => {
+    const done = () => { options.signal.removeEventListener('abort', cancel); resolve(); };
+    const timer = setTimeout(done, ms);
+    const cancel = () => { clearTimeout(timer); options.signal.removeEventListener('abort', cancel); reject(options.signal.reason || new DOMException('Cancelled', 'AbortError')); };
+    options.signal.addEventListener('abort', cancel, { once: true });
+    if (options.signal.aborted) cancel();
+  });
+  assertDocument(options);
+}
+
+function assertActionTarget(target, options = {}) {
+  assertDocument(options);
+  if (!target.isConnected || target.ownerDocument !== document) throw new Error('stale_target: inspect the current document again');
+  if (!isClickable(target)) throw new Error('target_not_actionable');
+  const rect = target.getBoundingClientRect();
+  const x = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+  const y = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+  const hit = document.elementFromPoint(x, y);
+  if (!hit || (hit !== target && !target.contains(hit))) throw new Error('target_obscured: inspect before retrying');
+  return { x, y };
+}
+
+export function focusElement(options = {}) {
+  assertDocument(options);
+  const target = options.selector ? findAnyTarget(options) : document.activeElement;
+  if (!target) return { success: false, error: 'focus_target_not_found' };
+  assertActionTarget(target, options);
+  target.focus();
+  return { success: document.activeElement === target, documentId: documentIdentity, selector: cssPath(target) };
 }

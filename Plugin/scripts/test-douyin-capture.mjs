@@ -23,7 +23,7 @@ function fixture({ url = `https://www.douyin.com/jingxuan?modal_id=${currentId}`
   current.getBoundingClientRect = () => ({ left: 0, top: 0, right: 1112, bottom: 927, width: 1112, height: 927 });
   other.currentSrc = 'blob:https://www.douyin.com/other';
   current.currentSrc = 'blob:https://www.douyin.com/current';
-  const location = { href: url };
+  const location = { href: url, origin: new URL(url).origin };
   const fetches = [];
   const context = vm.createContext({
     window, document, Element: window.Element, location, URL, AbortSignal,
@@ -132,4 +132,81 @@ test('direct player MP4 fallback retains scoped text and never sends blob URLs t
   assert.equal(payload.title, '当前作品');
   assert.equal(payload.author, '当前作者');
   assert.equal(payload.videoDataUrl, '');
+});
+
+test('detail containers expose an exact work ID through their video class', async () => {
+  const f = fixture({ url: 'https://www.douyin.com/' });
+  f.current.parentElement.removeAttribute('data-e2e-vid');
+  f.current.parentElement.setAttribute('data-e2e', 'player-container');
+  f.current.parentElement.className = `video_${currentId} video-detail-container`;
+  f.attach(item());
+  const payload = await f.run();
+  assert.equal(payload.noteId, currentId);
+  assert.equal(payload.captureDiagnostics.playerVideoId, currentId);
+  f.location.href = `https://www.douyin.com/video/${otherId}`;
+  await assert.rejects(f.run(), /当前可见/);
+});
+
+const playApi = 'https://www.douyin.com/aweme/v1/play/?video_id=current';
+const refreshedMedia = 'https://v11-web-prime.douyinvod.com/current/?mime_type=video_mp4&signature=fresh';
+
+test('the browser resolves the work play API and releases the probe body, preserving all fallback sources', async () => {
+  const f = fixture();
+  f.attach(item({ video: { playAddr: [{ src: currentMedia }], playApi } }));
+  let cancelled = false;
+  f.context.fetch = async (url, options) => {
+    assert.equal(url, playApi);
+    assert.equal(options.credentials, 'same-origin');
+    assert.equal(options.headers.Range, 'bytes=0-31');
+    return { ok: true, url: refreshedMedia, headers: new Headers({ 'content-type': 'video/mp4' }),
+      body: { cancel: async () => { cancelled = true; } } };
+  };
+  const payload = await f.run();
+  assert.equal(payload.videoUrl, refreshedMedia);
+  assert.deepEqual(Array.from(payload.videoUrls), [refreshedMedia, currentMedia, playApi]);
+  assert.equal(payload.captureDiagnostics.resolvedPlayback, true);
+  assert.equal(cancelled, true);
+});
+
+test('a rejected play API cannot discard complete CDN alternatives or promote an HTML response', async () => {
+  const f = fixture();
+  f.attach(item({ video: { playAddr: [{ src: currentMedia }, { src: otherMedia }], playApi } }));
+  let cancelled = false;
+  f.context.fetch = async () => ({ ok: true, url: refreshedMedia,
+    headers: new Headers({ 'content-type': 'text/html' }), body: { cancel: async () => { cancelled = true; } } });
+  const payload = await f.run();
+  assert.equal(payload.videoUrl, currentMedia);
+  assert.deepEqual(Array.from(payload.videoUrls), [currentMedia, otherMedia, playApi]);
+  assert.equal(payload.captureDiagnostics.resolvedPlayback, false);
+  assert.equal(cancelled, true);
+});
+
+test('resolution uses a complete bitrate play API after the default rejects, excluding DASH', async () => {
+  const f = fixture();
+  const fallbackApi = `${playApi}&quality=720p`;
+  f.attach(item({ video: { playAddr: [{ src: currentMedia }], playApi, bitRateList: [
+    { format: 'dash', playApi: `${playApi}&quality=dash` },
+    { format: 'mp4', playApi: fallbackApi },
+  ] } }));
+  const calls = [];
+  f.context.fetch = async (url) => {
+    calls.push(url);
+    return { ok: url === fallbackApi, url: refreshedMedia, headers: new Headers({ 'content-type': 'video/mp4' }),
+      body: { cancel: async () => {} } };
+  };
+  const payload = await f.run();
+  assert.deepEqual(calls, [playApi, fallbackApi]);
+  assert.equal(payload.videoUrl, refreshedMedia);
+  assert.equal(payload.videoUrls.some((url) => url.includes('quality=dash')), false);
+});
+
+test('switching the work during play API resolution aborts the capture', async () => {
+  const f = fixture();
+  f.attach(item({ video: { playAddr: [{ src: currentMedia }], playApi } }));
+  f.context.fetch = async () => {
+    f.current.parentElement.setAttribute('data-e2e-vid', otherId);
+    return { ok: true, url: refreshedMedia, headers: new Headers({ 'content-type': 'video/mp4' }),
+      body: { cancel: async () => {} } };
+  };
+  await assert.rejects(f.run(), /切换作品/);
 });

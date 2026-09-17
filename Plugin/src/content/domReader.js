@@ -1,4 +1,4 @@
-import { absolutizeSrcset, cssPath, normalizeWhitespace, toAbsoluteUrl, unique } from './domUtils.js';
+import { documentIdentity, absolutizeSrcset, cssPath, normalizeWhitespace, toAbsoluteUrl, unique } from './domUtils.js';
 
 export function readFrame(options) {
   const adapter = window.XWOW_SITE_ADAPTERS?.match?.() || null;
@@ -44,14 +44,65 @@ export function readFrame(options) {
   };
 }
 
+let snapshotCache = null;
+let snapshotSequence = 0;
+
 export function readDomSnapshot(options = {}) {
-  const frame = readFrame(options);
+  options.assertActive?.();
+  const cursor = Math.max(0, Number(options.cursor || 0));
+  const maxChars = Math.min(200_000, Math.max(1000, Number(options.maxChars || 6000)));
+  if (cursor > 0 && (!options.snapshotId || snapshotCache?.id !== options.snapshotId)) {
+    return { success: false, error: 'stale_snapshot: inspect from cursor 0 again', documentId: documentIdentity };
+  }
+  if (cursor === 0) {
+    const roots = options.selector ? [...document.querySelectorAll(options.selector)] : [document.documentElement];
+    if (roots.length !== 1) return { success: false, error: `snapshot_scope_requires_one_element: found ${roots.length}` };
+    const root = roots[0];
+    const clone = root.cloneNode(true);
+    const liveNodes = [root, ...root.querySelectorAll('*')];
+    const cloneNodes = [clone, ...clone.querySelectorAll('*')];
+    const keep = new Set(['id', 'class', 'role', 'name', 'type', 'href', 'src', 'alt', 'title', 'placeholder', 'for', 'data-testid', 'aria-label', 'aria-labelledby', 'aria-expanded', 'aria-checked', 'aria-disabled', 'aria-selected', 'disabled', 'checked', 'selected', 'multiple', 'contenteditable']);
+    for (let index = 0; index < cloneNodes.length; index += 1) {
+      const node = cloneNodes[index];
+      const live = liveNodes[index];
+      if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(node.tagName) || live.hasAttribute('data-xwow-ignore')) {
+        if (node === clone) return { success: false, error: 'snapshot_scope_not_observable' };
+        node.remove();
+        continue;
+      }
+      for (const attr of [...node.attributes]) if (!keep.has(attr.name)) node.removeAttribute(attr.name);
+      if (live.type === 'password' || live.type === 'hidden') {
+        node.removeAttribute('value');
+        node.textContent = '';
+      } else if (['INPUT', 'TEXTAREA', 'SELECT'].includes(live.tagName)) {
+        node.setAttribute('value', live.value || '');
+        if (live.checked) node.setAttribute('checked', '');
+        else node.removeAttribute('checked');
+      }
+      if (['VIDEO', 'AUDIO'].includes(live.tagName)) {
+        node.setAttribute('data-current-time', String(live.currentTime || 0));
+        node.setAttribute('data-duration', String(live.duration || 0));
+        node.setAttribute('data-paused', String(live.paused));
+      }
+    }
+    const content = clone.outerHTML || '';
+    snapshotCache = { id: `${documentIdentity}:${++snapshotSequence}`, content: content.slice(0, 2_000_000), sourceTruncated: content.length > 2_000_000, url: location.href, title: document.title || '' };
+  }
+  const content = snapshotCache.content.slice(cursor, cursor + maxChars);
+  const nextCursor = cursor + content.length;
   return {
     success: true,
-    dom_snapshot: frame.websiteMarkdownContent || '',
-    url: frame.url || location.href,
-    title: frame.title || document.title || '',
-    byteLength: new Blob([frame.websiteMarkdownContent || '']).size,
+    documentId: documentIdentity,
+    snapshotId: snapshotCache.id,
+    url: snapshotCache.url,
+    title: snapshotCache.title,
+    cursor,
+    nextCursor: nextCursor < snapshotCache.content.length ? nextCursor : null,
+    truncated: nextCursor < snapshotCache.content.length,
+    sourceTruncated: snapshotCache.sourceTruncated,
+    totalChars: snapshotCache.content.length,
+    byteLength: new Blob([content]).size,
+    dom_snapshot: content,
   };
 }
 

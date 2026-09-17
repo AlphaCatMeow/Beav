@@ -5,7 +5,7 @@ import { applyAgentCursorState, hideAgentCursor, moveAgentCursor } from './conte
 import { readDomSnapshot, readFrame } from './content/domReader.js';
 import { applyTabFaviconBadge } from './content/faviconBadge.js';
 import { readPageAssets } from './content/pageAssetInventory.js';
-import { checkElement, clickElement, clickNextButton, clickNode, detectBrowserAutomationBlocker, getElementAttribute, getElementValue, getElementValues, hoverElement, inspectPoint, isCheckedElement, isElementVisible, queryElements, scrollNode, scrollPage, selectElement, typeElement, waitForDomStable, waitForNode, waitForSelector } from './content/pageActions.js';
+import { checkElement, clickElement, clickNextButton, clickNode, detectBrowserAutomationBlocker, focusElement, getElementAttribute, getElementValue, getElementValues, hoverElement, inspectPoint, isCheckedElement, isElementVisible, queryElements, scrollNode, scrollPage, selectElement, typeElement, waitForDomStable, waitForNode, waitForSelector } from './content/pageActions.js';
 import { applySiteResearchFilters, extractSiteResearch, prepareSiteResearchItemClick, prepareSiteResearchItemClose, submitSiteResearchSearch } from './content/siteResearchExtractor.js';
 
 const XWOW_READ_FRAME = 'xwow-data-ai:read-frame';
@@ -48,8 +48,21 @@ const TARGET_GET_CURSOR_STATE = 'GET_AGENT_CURSOR_STATE';
 const TARGET_GET_CONTROL_BADGE_STATE = 'GET_AGENT_CONTROL_BADGE_STATE';
 const contentRuntime = installContentRuntimeLifecycle();
 
+const pendingContentRequests = new Map();
 function handleContentRuntimeMessage(message, sender, sendResponse) {
+  if (message?.type === 'xwow-data-ai:cancel-request') {
+    pendingContentRequests.get(message.requestId)?.abort();
+    sendResponse({ success: true });
+    return false;
+  }
   if (contentRuntime.disposed) return false;
+  const requestController = new AbortController();
+  if (message?.requestId) pendingContentRequests.set(message.requestId, requestController);
+  message = { ...message, options: { ...message?.options, signal: requestController.signal, assertActive: () => {
+    requestController.signal.throwIfAborted();
+    if (contentRuntime.disposed) throw new Error('content_runtime_disposed');
+  } } };
+
   void (async () => {
     if (message?.type === XWOW_CONTENT_PING || message?.type === TARGET_CONTENT_PING) {
       sendResponse({ success: true, ok: true, frameUrl: location.href });
@@ -113,6 +126,10 @@ function handleContentRuntimeMessage(message, sender, sendResponse) {
     }
     if (message?.type === XWOW_SELECT_ELEMENT) {
       sendResponse(await selectElement(message.options || {}));
+      return;
+    }
+    if (message?.type === 'xwow-data-ai:focus-element') {
+      sendResponse(focusElement(message.options || {}));
       return;
     }
     if (message?.type === XWOW_TYPE_ELEMENT) {
@@ -189,13 +206,15 @@ function handleContentRuntimeMessage(message, sender, sendResponse) {
     }
     sendResponse({ success: false, error: 'Unknown content message type' });
   })().catch((error) => {
-    sendResponse({ success: false, error: error instanceof Error ? error.message : String(error) });
-  });
+    sendResponse({ success: false, cancelled: requestController.signal.aborted, error: error instanceof Error ? error.message : String(error) });
+  }).finally(() => { if (message?.requestId) pendingContentRequests.delete(message.requestId); });
   return true;
 }
 
 chrome.runtime.onMessage.addListener(handleContentRuntimeMessage);
 contentRuntime.onDispose(() => {
+  for (const controller of pendingContentRequests.values()) controller.abort();
+  pendingContentRequests.clear();
   chrome.runtime.onMessage.removeListener(handleContentRuntimeMessage);
 });
 

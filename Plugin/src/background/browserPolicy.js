@@ -1,5 +1,3 @@
-export const DANGEROUS_ACTION_TEXT = /(save|submit|publish|delete|remove|refund|cancel order|ship order|change price|change inventory|change budget|enable ad|disable ad|保存|提交|发布|删除|移除|退款|取消订单|发货|改价|库存|预算|开启广告|关闭广告)/i;
-
 export const DANGEROUS_CDP_METHODS = /^(Browser\.close|Browser\.crash|Browser\.crashGpuProcess|Page\.crash|Page\.produceCompilationCache|Storage\.clearDataForOrigin|Network\.deleteCookies|Runtime\.terminateExecution|Target\.closeTarget)$/;
 export const STATE_CHANGING_CDP_METHODS = /^(Page\.navigate|Page\.reload|DOM\.set[A-Z].*|DOMStorage\.setDOMStorageItem|DOMStorage\.removeDOMStorageItem|Emulation\.set[A-Z].*|Network\.setCookie|Network\.clearBrowserCache|Network\.clearBrowserCookies|Storage\.clearDataForOrigin|Target\.closeTarget)$/;
 export const BROWSER_POLICY_CONTRACT_VERSION = 2;
@@ -110,6 +108,7 @@ export function classifyBrowserAction(type) {
 
 export function classifyBrowserActionPayload(action = {}) {
   if (String(action.type || '') === 'cdp.send') return classifyCdpMethod(action.method || action.command || '');
+  if (action.effect && action.effect !== 'none') return BROWSER_ACTION_LEVELS.STATE_CHANGING;
   return classifyBrowserAction(action.type);
 }
 
@@ -142,9 +141,10 @@ export function resolveBrowserPolicyPageUrl(action = {}, tab = {}, options = {})
 
 export function buildBrowserPolicyDecision(action, options = {}) {
   const isHttpUrl = options.isHttpUrl || ((url) => /^https?:\/\//i.test(String(url || '')));
-  const actionClass = action.actionClass || classifyBrowserActionPayload(action);
+  const actionClass = action.effect && action.effect !== 'none'
+    ? BROWSER_ACTION_LEVELS.STATE_CHANGING
+    : action.actionClass || classifyBrowserActionPayload(action);
   const actionClassMetadata = BROWSER_ACTION_CLASS_METADATA[actionClass] || null;
-  const pageText = [action.selector, action.text, action.label, action.textRegex, action.url, action.currentUrl, action.method].filter(Boolean).join(' ');
   const actionType = String(action.type || '');
   const pageBoundAction = ![
     'download.wait',
@@ -250,9 +250,6 @@ export function buildBrowserPolicyDecision(action, options = {}) {
   if (pageBoundAction && !resolveBrowserPolicyPageUrl(action, {}, { isHttpUrl }) && !actionType.startsWith('tab.create')) {
     return deniedPolicyDecision('denied_page_not_allowlisted', action, actionClass, actionClassMetadata, { approval });
   }
-  if ((actionType === 'page.click' || actionType === 'page.doubleClick' || actionType === 'page.type' || actionType.startsWith('input.')) && DANGEROUS_ACTION_TEXT.test(pageText)) {
-    return deniedPolicyDecision('denied_dangerous_action', action, actionClass, actionClassMetadata, { approval });
-  }
   return {
     allowed: true,
     reason: 'allowed_by_page_plan',
@@ -270,7 +267,6 @@ export function buildBrowserPolicyMetadata() {
     actionLevels: { ...BROWSER_ACTION_LEVELS },
     actionClassMetadata: { ...BROWSER_ACTION_CLASS_METADATA },
     approvalScopes: { ...BROWSER_POLICY_APPROVAL_SCOPES },
-    dangerousTextPattern: DANGEROUS_ACTION_TEXT.source,
     dangerousCdpPattern: DANGEROUS_CDP_METHODS.source,
     stateChangingCdpPattern: STATE_CHANGING_CDP_METHODS.source,
     approvalTokenBindings: ['actionType', 'actionTypes', 'method', 'methods', 'sessionId', 'tabId', 'requestId', 'tokenId'],

@@ -70,7 +70,8 @@ export async function extractDouyinVideoPayload() {
 
   function nodeVideoId(node) {
     return normalizeText(node?.getAttribute('data-e2e-vid')
-      || node?.getAttribute('data-e2e-aweme-id'));
+      || node?.getAttribute('data-e2e-aweme-id')
+      || node?.getAttribute('class')?.match(/(?:^|\s)video_(\d{8,})(?=\s|$)/)?.[1]);
   }
 
   function visibleArea(node) {
@@ -86,19 +87,28 @@ export async function extractDouyinVideoPayload() {
   }
 
   function videoRoot(video) {
-    return video.closest('[data-e2e-vid], [data-e2e-aweme-id]');
+    // The work container owns selection; nested video-info IDs do not.
+    return video.closest('[data-e2e="feed-active-video"], [data-e2e="feed-video"], .video-detail-container[data-e2e="player-container"]')
+      || video.closest('[data-e2e-vid], [data-e2e-aweme-id]');
   }
 
   function getMainVideoElement(urlId) {
     const candidates = Array.from(document.querySelectorAll('video'))
       .map((video) => ({ video, root: videoRoot(video), area: visibleArea(video) }))
-      .filter(({ root, area }) => area > 0 && (!urlId || !nodeVideoId(root) || nodeVideoId(root) === urlId));
-    candidates.sort((a, b) => {
-      const priority = ({ root }) => Number(Boolean(urlId && nodeVideoId(root) === urlId)) * 2
-        + Number(root?.getAttribute('data-e2e') === 'feed-active-video');
-      return priority(b) - priority(a) || b.area - a.area;
-    });
-    return candidates[0]?.video || null;
+      .filter(({ root, area }) => area > 0
+        && root?.getAttribute('data-e2e') !== 'feed-video'
+        && (!urlId || !nodeVideoId(root) || nodeVideoId(root) === urlId));
+    const priority = ({ root }) => Number(Boolean(urlId && nodeVideoId(root) === urlId)) * 4
+      + Number(Boolean(root?.matches('.video-detail-container[data-e2e="player-container"]'))) * 2
+      + Number(root?.getAttribute('data-e2e') === 'feed-active-video');
+    const topPriority = Math.max(...candidates.map(priority));
+    const selected = candidates.filter((candidate) => priority(candidate) === topPriority);
+    // Two visible works during a feed transition are ambiguous. Never let a
+    // larger preload or an old, still-connected player win by its dimensions.
+    if (new Set(selected.map(({ root }) => root)).size !== 1) return null;
+    if (selected.length === 1) return selected[0].video;
+    const playing = selected.filter(({ video }) => !video.paused && !video.ended && video.readyState >= 2);
+    return playing.length === 1 ? playing[0].video : null;
   }
 
   function awemeId(value) {
@@ -117,12 +127,12 @@ export async function extractDouyinVideoPayload() {
       if (!value || typeof value !== 'object' || seen.has(value) || value instanceof Element) continue;
       seen.add(value);
       const candidateId = awemeId(value);
-      if (candidateId === id && value.video) return value;
+      if (candidateId === id && value.video && getVideoUrls(value, null).length > 0) return value;
       if (candidateId && candidateId !== id) continue;
       if (depth >= 16) continue;
       for (const key of Object.keys(value)) {
         // Do not follow React's fiber/owner graph or invoke getters.
-        if (key.startsWith('_') || ['return', 'alternate', 'stateNode'].includes(key)) continue;
+        if (key.startsWith('_') || ['return', 'alternate', 'stateNode', 'queue', 'baseQueue', 'deps'].includes(key)) continue;
         const child = Object.getOwnPropertyDescriptor(value, key)?.value;
         if (child && typeof child === 'object' && queue.length < maxNodes) {
           queue.push({ value: child, depth: depth + 1 });
@@ -133,16 +143,22 @@ export async function extractDouyinVideoPayload() {
   }
 
   function getCurrentAweme(video, root, id) {
-    // React data is read only from this player's ancestry and matched by aweme ID.
+    // Feed data is loaded after RENDER_DATA and may live in a hook/ref rather
+    // than props. Read only this player's ancestry, always by exact work ID.
+    const seenFibers = new Set();
     for (let node = video; node; node = node.parentElement) {
       const keys = Object.keys(node);
       const props = node[keys.find((key) => key.startsWith('__reactProps$'))];
-      const fromProps = findAweme(props, id, 500);
+      const fromProps = findAweme(props, id);
       if (fromProps) return { item: fromProps, source: 'player-props' };
       let fiber = node[keys.find((key) => key.startsWith('__reactFiber$'))];
       for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
-        const fromFiber = findAweme(fiber.memoizedProps, id, 500);
+        if (seenFibers.has(fiber)) break;
+        seenFibers.add(fiber);
+        const fromFiber = findAweme(fiber.memoizedProps, id);
         if (fromFiber) return { item: fromFiber, source: 'player-props' };
+        const fromState = findAweme(fiber.memoizedState, id);
+        if (fromState) return { item: fromState, source: 'player-state' };
       }
       if (node === root) break;
     }
@@ -194,18 +210,52 @@ export async function extractDouyinVideoPayload() {
     const add = (value) => addressUrls(value).filter(isCompleteVideoUrl).forEach((url) => pushUniqueUrl(urls, url));
     // Default play addresses carry complete audio + video; prefer H.264 for compatibility.
     add(data.playAddr || data.play_addr);
-    const rates = (data.bitRateList || data.bit_rate || []).filter((rate) => (
-      !/dash|hls/i.test(String(rate.format || rate.videoFormat || rate.video_format || ''))
+    const rawRates = data.bitRateList || data.bit_rate;
+    const rates = (Array.isArray(rawRates) ? rawRates : []).filter((rate) => (
+      rate && typeof rate === 'object'
+      && !/dash|hls/i.test(String(rate.format || rate.videoFormat || rate.video_format || ''))
     )).sort((a, b) => Number(a.isH265 || a.is_h265 || 0) - Number(b.isH265 || b.is_h265 || 0)
       || Number(b.bitRate || b.bit_rate || 0) - Number(a.bitRate || a.bit_rate || 0));
     for (const rate of rates) add(rate.playAddr || rate.play_addr);
     add(data.playAddrH265 || data.play_addr_h265);
     add(data.playApi || data.play_api);
+    for (const rate of rates) add(rate.playApi || rate.play_api);
     if (!item) {
       add(video.currentSrc || video.src);
       for (const source of video.querySelectorAll('source')) add(source.src);
     }
     return urls;
+  }
+
+  async function resolveVideoPlaybackUrl(candidates) {
+    // Feed CDN URLs can reject downloads even with Referer. Resolve the work's
+    // own play endpoint in its browser session to obtain a fresh signed URL.
+    const playApis = candidates.filter((value) => {
+      const url = new URL(value);
+      return url.origin === location.origin && /^\/aweme\/v1\/play\/?$/.test(url.pathname);
+    });
+    const signal = AbortSignal.timeout(8_000);
+    for (const playApi of playApis.slice(0, 2)) {
+      let response;
+      try {
+        response = await fetch(playApi, {
+          credentials: 'same-origin',
+          headers: { Range: 'bytes=0-31' },
+          cache: 'no-store',
+          signal,
+        });
+        const resolved = response.url;
+        if (response.ok && /^video\/mp4(?:;|$)/i.test(response.headers.get('content-type') || '')
+          && isCompleteVideoUrl(resolved) && new URL(resolved).origin !== location.origin) {
+          return resolved;
+        }
+      } catch { /* Keep the other complete sources available to Desktop. */ }
+      finally {
+        try { await response?.body?.cancel(); } catch { /* Already closed or aborted. */ }
+      }
+      if (signal.aborted) break;
+    }
+    return '';
   }
 
   function getTitle() {
@@ -377,12 +427,20 @@ export async function extractDouyinVideoPayload() {
   const currentUrlVideoId = extractDouyinVideoIdFromUrl(initialUrl);
   const videoEl = getMainVideoElement(currentUrlVideoId);
   if (!videoEl) throw new Error('未找到当前可见的抖音视频，请打开作品并播放后重试');
-  const root = videoRoot(videoEl) || videoEl.closest('[data-e2e="feed-active-video"], [data-e2e="detail-video-info"]') || videoEl.parentElement;
+  const initialPlayerRoot = videoRoot(videoEl);
+  const root = initialPlayerRoot || videoEl.closest('[data-e2e="feed-active-video"], [data-e2e="detail-video-info"]') || videoEl.parentElement;
+  const initialSelection = root?.getAttribute('data-e2e') || '';
   const videoId = currentUrlVideoId || nodeVideoId(root);
   if (!/^\d{8,}$/.test(videoId)) throw new Error('未能确认当前抖音作品，请打开视频详情后重试');
   const initialPlayerSrc = videoEl.currentSrc || videoEl.src;
   const { item, source: dataSource } = getCurrentAweme(videoEl, root, videoId);
   const videoCandidates = getVideoUrls(item, videoEl);
+  const resolvedVideoUrl = await resolveVideoPlaybackUrl(videoCandidates);
+  if (resolvedVideoUrl) {
+    const duplicateIndex = videoCandidates.indexOf(resolvedVideoUrl);
+    if (duplicateIndex >= 0) videoCandidates.splice(duplicateIndex, 1);
+    videoCandidates.unshift(resolvedVideoUrl);
+  }
   const videoUrl = videoCandidates[0] || '';
   const blobVideoUrl = /^blob:/i.test(initialPlayerSrc) ? initialPlayerSrc : '';
   const videoDataUrl = !videoUrl && !item && blobVideoUrl
@@ -396,7 +454,8 @@ export async function extractDouyinVideoPayload() {
     ? await fetchBinaryAsDataUrl(rawCoverUrl, 'image/')
     : captureVideoCoverDataUrl(videoEl);
   // Extraction can await media reads while an SPA switches the selected work.
-  if (location.href !== initialUrl || !videoEl.isConnected || visibleArea(videoEl) === 0
+  if (location.href !== initialUrl || !videoEl.isConnected || getMainVideoElement(currentUrlVideoId) !== videoEl
+    || videoRoot(videoEl) !== initialPlayerRoot || (root?.getAttribute('data-e2e') || '') !== initialSelection
     || (nodeVideoId(root) && nodeVideoId(root) !== videoId)
     || (videoEl.currentSrc || videoEl.src) !== initialPlayerSrc) {
     throw new Error('抖音已切换作品，请在当前视频停留后重新保存');
@@ -442,6 +501,7 @@ export async function extractDouyinVideoPayload() {
     coverUrl: rawCoverUrl || '',
     coverDataUrl,
     videoUrl,
+    videoUrls: videoCandidates,
     videoDataUrl: videoDataUrl || '',
     stats: item?.statistics ? {
       likes: Number(item.statistics.digg_count || 0),
@@ -452,11 +512,13 @@ export async function extractDouyinVideoPayload() {
     captureDiagnostics: {
       urlVideoId: currentUrlVideoId,
       playerVideoId: nodeVideoId(root),
+      playerSelection: initialSelection || 'detail',
       matchedVideoId: awemeId(item),
       dataSource,
       playerSourceType: blobVideoUrl ? 'blob' : 'http',
       candidateCount: videoCandidates.length,
       mediaHost: videoUrl ? new URL(videoUrl).hostname : '',
+      resolvedPlayback: Boolean(resolvedVideoUrl),
       durationMs: Number(item?.video?.duration || videoEl.duration * 1000 || 0),
     },
     commentsSnapshot,

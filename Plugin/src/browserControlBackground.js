@@ -1,4 +1,4 @@
-import { assertBrowserActionAllowed, BROWSER_ACTION_LEVELS, browserPolicyError, buildBrowserPolicyMetadata, classifyBrowserAction, DANGEROUS_ACTION_TEXT, DANGEROUS_CDP_METHODS, resolveBrowserPolicyPageUrl } from './background/browserPolicy.js';
+import { assertBrowserActionAllowed, BROWSER_ACTION_LEVELS, browserPolicyError, buildBrowserPolicyMetadata, classifyBrowserAction, DANGEROUS_CDP_METHODS, resolveBrowserPolicyPageUrl } from './background/browserPolicy.js';
 import { createActiveTabObserver } from './background/activeTabObserver.js';
 import { buildBrowserCapabilityMetadata, buildPluginRegistrationPayload } from './background/browserCapabilities.js';
 import { createBrowserControlRuntime } from './background/browserControlRuntime.js';
@@ -22,7 +22,7 @@ import { PLUGIN_DIAGNOSTICS_RETRY_ALARM, drainPluginDiagnostics, reportPluginErr
 import { CONTENT_PAGE_ASSETS_TYPE, bundlePageAssets, readPageAssetInventory } from './background/pageAssetRuntime.js';
 import { exportPage } from './background/pageExportRuntime.js';
 import { evaluatePageScript } from './background/pageScriptRuntime.js';
-import { CONTENT_CURSOR_ARRIVED_TYPE, TARGET_CURSOR_ARRIVED_TYPE, TARGET_GET_CURSOR_STATE_TYPE, clearCursorOverlayForLeases, clearCursorOverlayForTab, configurePixelInputTelemetry, dispatchKeyboardCombo, dispatchKeyboardPress, dispatchKeyboardType, dispatchMouseClick, dispatchMouseDrag, dispatchMouseMove, dispatchMouseWheel, hasPendingCursorArrivals, hideCursorOverlay, moveCursorOverlay, notifyCursorArrived, readCursorOverlayState, republishCursorOverlayStateForTab } from './background/pixelInput.js';
+import { CONTENT_CURSOR_ARRIVED_TYPE, TARGET_CURSOR_ARRIVED_TYPE, TARGET_GET_CURSOR_STATE_TYPE, clearCursorOverlayForLeases, clearCursorOverlayForTab, configurePixelInputTelemetry, dispatchKeyboardCombo, dispatchKeyboardPress, dispatchKeyboardType, dispatchMouseClick, dispatchMouseDrag, dispatchMouseMove, dispatchMouseWheel, hasPendingCursorArrivals, hideCursorOverlay, modifierMaskFromAction, moveCursorOverlay, notifyCursorArrived, readCursorOverlayState, republishCursorOverlayStateForTab } from './background/pixelInput.js';
 import { closeSidePanel, configureSidePanelTelemetry, getSidePanelStatus, openSidePanel, registerSidePanelStatus, requireSidePanelOpen, restoreSidePanelStatus, toggleSidePanel } from './background/sidePanelStatus.js';
 import { listSiteCapabilities, runSiteResearch, SITE_RESEARCH_CONTRACT_VERSION } from './background/siteResearchRuntime.js';
 import { TARGET_GET_CONTROL_BADGE_STATE_TYPE, initializeTabControlBadges, readTabControlBadgeState } from './background/tabControlBadge.js';
@@ -68,7 +68,7 @@ const CONTENT_GET_VALUES_TYPE = 'xwow-data-ai:get-values';
 const CONTENT_GET_ATTRIBUTE_TYPE = 'xwow-data-ai:get-attribute';
 const CONTENT_QUERY_ELEMENTS_TYPE = 'xwow-data-ai:query-elements';
 const CONTENT_DETECT_BROWSER_BLOCKER_TYPE = 'xwow-data-ai:detect-browser-blocker';
-const CONTROLLED_PAGE_MUTATION_ACTIONS = new Set(['page.navigate', 'page.goto', 'page.waitForLoadState', 'page.waitForURL', 'page.waitForTimeout', 'page.evaluate', 'page.evaluateScript', 'page.scroll', 'page.click', 'page.clickNode', 'node.click', 'page.hover', 'page.inspectPoint', 'page.hitTest', 'page.scrollNode', 'node.scroll', 'page.waitForNode', 'node.wait', 'page.waitForSelector', 'page.waitSelector', 'page.check', 'page.setChecked', 'page.isChecked', 'page.isVisible', 'page.getValue', 'page.getValues', 'page.getAttribute', 'page.queryElements', 'page.domSnapshot', 'page.export', 'tab.export', 'page.consoleLogs', 'tab_console_logs', 'tab.consoleLogs', 'page.select', 'page.type', 'page.frames', 'page.readClipboard', 'clipboard.read', 'page.readClipboardText', 'clipboard.readText', 'page.writeClipboard', 'clipboard.write', 'page.writeClipboardText', 'clipboard.writeText', 'page.waitForFileChooser', 'page.acceptFileChooser', 'page.setInputFiles', 'fileChooser.accept', 'webmcp.listTools', 'webmcp.invokeTool', 'webmcp_list_tools', 'webmcp_invoke_tool', 'input.mouseDrag', 'input.mouseWheel', 'input.keyboardType', 'input.keyboardPress', 'input.keyboardCombo']);
+const CONTROLLED_PAGE_MUTATION_ACTIONS = new Set(['page.navigate', 'page.goto', 'page.waitForLoadState', 'page.waitForURL', 'page.waitForTimeout', 'page.evaluate', 'page.evaluateScript', 'page.scroll', 'page.click', 'page.clickNode', 'node.click', 'page.hover', 'page.inspectPoint', 'page.hitTest', 'page.scrollNode', 'node.scroll', 'page.waitForNode', 'node.wait', 'page.waitForSelector', 'page.waitSelector', 'page.check', 'page.setChecked', 'page.isChecked', 'page.isVisible', 'page.getValue', 'page.getValues', 'page.getAttribute', 'page.queryElements', 'page.domSnapshot', 'page.export', 'tab.export', 'page.consoleLogs', 'tab_console_logs', 'tab.consoleLogs', 'page.select', 'page.type', 'page.screenshot', 'page.frames', 'page.readClipboard', 'clipboard.read', 'page.readClipboardText', 'clipboard.readText', 'page.writeClipboard', 'clipboard.write', 'page.writeClipboardText', 'clipboard.writeText', 'page.waitForFileChooser', 'page.acceptFileChooser', 'page.setInputFiles', 'fileChooser.accept', 'webmcp.listTools', 'webmcp.invokeTool', 'webmcp_list_tools', 'webmcp_invoke_tool', 'input.mouseDrag', 'input.mouseWheel', 'input.keyboardType', 'input.keyboardPress', 'input.keyboardCombo']);
 const INTERNAL_SUBSCRIPTION_ACTIONS = new Set(['subscription.scan.v1', 'subscription.capture.v1']);
 const CDP_COMMAND_TIMEOUT_MS = getDefaultCdpTimeoutMs();
 
@@ -1191,7 +1191,10 @@ async function openUrl(url, options = {}) {
   const tab = existingTabId
     ? await chrome.tabs.update(existingTabId, { url, active: options.active !== false })
     : (await createControlledTab({ url, active: options.active !== false })).tab;
-  if (tab?.id) await claimTabForActiveSession(tab.id, existingTabId ? 'user' : 'agent', 'source');
+  if (tab?.id) {
+    if (options.session) await claimTabForSession(options.session, tab.id, existingTabId ? 'user' : 'agent', 'source');
+    else await claimTabForActiveSession(tab.id, existingTabId ? 'user' : 'agent', 'source');
+  }
   if (options.waitUntilComplete !== false) {
     await waitForTabComplete(tab.id, Number(options.timeoutMs || 30_000));
   }
@@ -1446,6 +1449,7 @@ async function runInternalSubscriptionAction(type, payload) {
 }
 
 async function runBrowserAction(action, context = {}) {
+  await ensureInitialized();
   let session = context.session || activeBrowserSession || (await resolveBrowserActionSession('', 'manual_repair'));
   const normalized = normalizeBrowserAction(action);
   const startedAt = new Date().toISOString();
@@ -1456,6 +1460,7 @@ async function runBrowserAction(action, context = {}) {
   let terminalResponse = null;
   let terminalBrowserError = null;
   let actionCleanup = null;
+  let requestSignal = null;
   try {
     const preparedTurn = await prepareBrowserActionTurn(session, normalized);
     session = preparedTurn.session || session;
@@ -1495,11 +1500,15 @@ async function runBrowserAction(action, context = {}) {
       actionSuccess = terminalResponse?.success !== false;
       return terminalResponse;
     }
-    await browserControlRuntime.startRequest(session.sessionId, requestTabId, {
+    requestSignal = await browserControlRuntime.startRequest(session.sessionId, requestTabId, {
       turnId: session.currentTurnId || session.turnId,
       publishTabs: false,
+      autoStart: false,
       reason: 'browser_action_request_started',
-    }).catch(() => {});
+    });
+    const sendRequestContent = (tabId, type, options = {}, frameId) => sendContentMessage(
+      tabId, type, options, frameId ?? options.frameId ?? 0, { signal: requestSignal },
+    );
     session = activeRequest.session || session;
     if (activeBrowserSession?.sessionId === session.sessionId) {
       activeBrowserSession = session;
@@ -1522,6 +1531,7 @@ async function runBrowserAction(action, context = {}) {
         tabId: requestTabId,
       }).catch(() => {});
     }
+    requestSignal.throwIfAborted();
     let result;
     switch (normalized.type) {
       case 'tab.create':
@@ -1538,6 +1548,7 @@ async function runBrowserAction(action, context = {}) {
           result = { success: true, tab: tabInfo(tab), window: normalizeCreatedWindow(window), createdWindow: true };
         } else if (normalized.url) {
           result = await openUrl(normalized.url, {
+            session,
             active: normalized.active !== false,
             waitUntilComplete: normalized.waitUntilComplete !== false,
           });
@@ -1596,7 +1607,7 @@ async function runBrowserAction(action, context = {}) {
         break;
       case 'browser.botDetect':
         await requireActiveControlledTabLease(session, normalized.tabId, 'browser.botDetect');
-        result = await sendContentMessage(normalized.tabId, CONTENT_DETECT_BROWSER_BLOCKER_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_DETECT_BROWSER_BLOCKER_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'browser.authHandoff':
         result = await requestBrowserUserHandoff(session, normalized);
@@ -1609,19 +1620,19 @@ async function runBrowserAction(action, context = {}) {
           waitForTabComplete,
           readSnapshot: async (tabId) => {
             await requireActiveControlledTabLease(session, tabId, 'research.run');
-            return await sendContentMessage(tabId, CONTENT_DOM_SNAPSHOT_TYPE, {});
+            return await sendRequestContent(tabId, CONTENT_DOM_SNAPSHOT_TYPE, {});
           },
           readSiteEvidence: async (tabId, options) => {
             await requireActiveControlledTabLease(session, tabId, 'research.run');
-            return await sendContentMessage(tabId, CONTENT_SITE_RESEARCH_EXTRACT_TYPE, options || {});
+            return await sendRequestContent(tabId, CONTENT_SITE_RESEARCH_EXTRACT_TYPE, options || {});
           },
           applyFilters: async (tabId, options) => {
             await requireActiveControlledTabLease(session, tabId, 'research.run');
-            return await sendContentMessage(tabId, CONTENT_SITE_RESEARCH_APPLY_FILTERS_TYPE, options || {});
+            return await sendRequestContent(tabId, CONTENT_SITE_RESEARCH_APPLY_FILTERS_TYPE, options || {});
           },
           submitSearch: async (tabId, options) => {
             await requireActiveControlledTabLease(session, tabId, 'research.run');
-            return await sendContentMessage(tabId, CONTENT_SITE_RESEARCH_SUBMIT_SEARCH_TYPE, options || {});
+            return await sendRequestContent(tabId, CONTENT_SITE_RESEARCH_SUBMIT_SEARCH_TYPE, options || {});
           },
           openItem: async (tabId, options) => {
             await requireActiveControlledTabLease(session, tabId, 'research.run');
@@ -1633,7 +1644,7 @@ async function runBrowserAction(action, context = {}) {
           },
           scrollPage: async (tabId) => {
             await requireActiveControlledTabLease(session, tabId, 'research.run');
-            return await sendContentMessage(tabId, CONTENT_SCROLL_TYPE, { deltaY: 800 });
+            return await sendRequestContent(tabId, CONTENT_SCROLL_TYPE, { deltaY: 800 });
           },
           closeTab: async (tabId) => await closeControlledTab(session, {
             tabId,
@@ -1733,7 +1744,7 @@ async function runBrowserAction(action, context = {}) {
       case 'page.waitReady':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.waitReady');
         await waitForTabComplete(normalized.tabId, Number(normalized.timeoutMs || 10_000));
-        result = await sendContentMessage(normalized.tabId, CONTENT_WAIT_STABLE_TYPE, normalized.options || {}, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_WAIT_STABLE_TYPE, normalized.options || {}, normalized.options?.frameId);
         break;
       case 'page.waitForLoadState': {
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.waitForLoadState');
@@ -1769,7 +1780,7 @@ async function runBrowserAction(action, context = {}) {
         break;
       case 'page.domSnapshot':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.domSnapshot');
-        result = await sendContentMessage(normalized.tabId, CONTENT_DOM_SNAPSHOT_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_DOM_SNAPSHOT_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.evaluate':
       case 'page.evaluateScript':
@@ -1778,86 +1789,106 @@ async function runBrowserAction(action, context = {}) {
         break;
       case 'page.scroll':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.scroll');
-        result = await sendContentMessage(normalized.tabId, CONTENT_SCROLL_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_SCROLL_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.click':
-      case 'page.doubleClick':
+      case 'page.doubleClick': {
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.click');
-        result = await sendContentMessage(normalized.tabId, CONTENT_CLICK_ELEMENT_TYPE, {
-          ...(normalized.options || normalized),
-          doubleClick: normalized.type === 'page.doubleClick' || normalized.doubleClick === true || normalized.options?.doubleClick === true,
-        }, normalized.options?.frameId);
-        if (normalized.options?.waitAfterClickMs) await sleep(Number(normalized.options.waitAfterClickMs));
+        const options = normalized.options || normalized;
+        const useBrowserInput = options.inputMode !== 'dom';
+        if (useBrowserInput) {
+          await attachCdpTab(Number(normalized.tabId));
+          await chrome.tabs.update(Number(normalized.tabId), { active: true });
+        }
+        result = await sendRequestContent(normalized.tabId, CONTENT_CLICK_ELEMENT_TYPE, {
+          ...options,
+          prepareOnly: useBrowserInput,
+          doubleClick: normalized.type === 'page.doubleClick' || options.doubleClick === true,
+        }, options.frameId);
+        if (useBrowserInput && result.success) {
+          const target = result.response;
+          requestSignal.throwIfAborted();
+          const point = { x: target.x, y: target.y, button: options.button || 'left', modifiers: modifierMaskFromAction(options) };
+          const count = Math.min(3, Math.max(1, Number(options.clickCount || (normalized.type === 'page.doubleClick' || options.doubleClick ? 2 : 1))));
+          for (let clickCount = 1; clickCount <= count; clickCount += 1) {
+            requestSignal.throwIfAborted();
+            await sendCdpCommandWithTimeout({ tabId: Number(normalized.tabId) }, 'Input.dispatchMouseEvent', { ...point, clickCount, type: 'mousePressed' }, 5000);
+            // Release a pressed button even if cancellation arrives after the press.
+            await sendCdpCommandWithTimeout({ tabId: Number(normalized.tabId) }, 'Input.dispatchMouseEvent', { ...point, clickCount, type: 'mouseReleased' }, 5000);
+          }
+          result = { success: true, tabId: normalized.tabId, documentId: target.documentId, selector: target.selector, text: target.text, inputMode: 'browser', outcome: 'input_dispatched' };
+        }
         break;
+      }
       case 'page.clickNode':
       case 'node.click':
         await requireActiveControlledTabLease(session, normalized.tabId, normalized.type);
-        result = await sendContentMessage(normalized.tabId, CONTENT_CLICK_NODE_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_CLICK_NODE_TYPE, normalized.options || normalized, normalized.options?.frameId);
         if (normalized.options?.waitAfterClickMs) await sleep(Number(normalized.options.waitAfterClickMs));
         break;
       case 'page.hover':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.hover');
-        result = await sendContentMessage(normalized.tabId, CONTENT_HOVER_ELEMENT_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_HOVER_ELEMENT_TYPE, normalized.options || normalized, normalized.options?.frameId);
         if (normalized.options?.waitAfterHoverMs) await sleep(Number(normalized.options.waitAfterHoverMs));
         break;
       case 'page.inspectPoint':
       case 'page.hitTest':
         await requireActiveControlledTabLease(session, normalized.tabId, normalized.type);
-        result = await sendContentMessage(normalized.tabId, CONTENT_INSPECT_POINT_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_INSPECT_POINT_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.scrollNode':
       case 'node.scroll':
         await requireActiveControlledTabLease(session, normalized.tabId, normalized.type);
-        result = await sendContentMessage(normalized.tabId, CONTENT_SCROLL_NODE_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_SCROLL_NODE_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.waitForNode':
       case 'node.wait':
         await requireActiveControlledTabLease(session, normalized.tabId, normalized.type);
-        result = await sendContentMessage(normalized.tabId, CONTENT_WAIT_NODE_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_WAIT_NODE_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.waitForSelector':
       case 'page.waitSelector':
         await requireActiveControlledTabLease(session, normalized.tabId, normalized.type);
-        result = await sendContentMessage(normalized.tabId, CONTENT_WAIT_SELECTOR_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_WAIT_SELECTOR_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.check':
       case 'page.setChecked':
         await requireActiveControlledTabLease(session, normalized.tabId, normalized.type);
-        result = await sendContentMessage(normalized.tabId, CONTENT_CHECK_ELEMENT_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_CHECK_ELEMENT_TYPE, normalized.options || normalized, normalized.options?.frameId);
         if (normalized.options?.waitAfterCheckMs) await sleep(Number(normalized.options.waitAfterCheckMs));
         break;
       case 'page.isChecked':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.isChecked');
-        result = await sendContentMessage(normalized.tabId, CONTENT_IS_CHECKED_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_IS_CHECKED_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.isVisible':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.isVisible');
-        result = await sendContentMessage(normalized.tabId, CONTENT_IS_VISIBLE_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_IS_VISIBLE_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.getValue':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.getValue');
-        result = await sendContentMessage(normalized.tabId, CONTENT_GET_VALUE_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_GET_VALUE_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.getValues':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.getValues');
-        result = await sendContentMessage(normalized.tabId, CONTENT_GET_VALUES_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_GET_VALUES_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.getAttribute':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.getAttribute');
-        result = await sendContentMessage(normalized.tabId, CONTENT_GET_ATTRIBUTE_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_GET_ATTRIBUTE_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.queryElements':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.queryElements');
-        result = await sendContentMessage(normalized.tabId, CONTENT_QUERY_ELEMENTS_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_QUERY_ELEMENTS_TYPE, normalized.options || normalized, normalized.options?.frameId);
         break;
       case 'page.select':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.select');
-        result = await sendContentMessage(normalized.tabId, CONTENT_SELECT_ELEMENT_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_SELECT_ELEMENT_TYPE, normalized.options || normalized, normalized.options?.frameId);
         if (normalized.options?.waitAfterSelectMs) await sleep(Number(normalized.options.waitAfterSelectMs));
         break;
       case 'page.type':
         await requireActiveControlledTabLease(session, normalized.tabId, 'page.type');
-        result = await sendContentMessage(normalized.tabId, CONTENT_TYPE_ELEMENT_TYPE, normalized.options || normalized, normalized.options?.frameId);
+        result = await sendRequestContent(normalized.tabId, CONTENT_TYPE_ELEMENT_TYPE, normalized.options || normalized, normalized.options?.frameId);
         if (normalized.options?.waitAfterTypeMs) await sleep(Number(normalized.options.waitAfterTypeMs));
         break;
       case 'page.readClipboard':
@@ -1909,7 +1940,8 @@ async function runBrowserAction(action, context = {}) {
         result = await invokeWebMcpTool(normalized);
         break;
       case 'page.screenshot':
-        result = await captureVisibleTabScreenshot(normalized.tabId, normalized);
+        await requireActiveControlledTabLease(session, normalized.tabId, 'page.screenshot');
+        result = await captureCdpScreenshot(normalized);
         break;
       case 'browser.fetchUrls':
       case 'page.fetchUrls':
@@ -2075,10 +2107,15 @@ async function runBrowserAction(action, context = {}) {
         await requireActiveControlledTabLease(session, normalized.tabId || session.activeTabId || activeBrowserSession?.activeTabId, 'input.keyboardType');
         result = await dispatchKeyboardType(normalized, { activeTabId: session.activeTabId || activeBrowserSession?.activeTabId });
         break;
-      case 'input.keyboardPress':
-        await requireActiveControlledTabLease(session, normalized.tabId || session.activeTabId || activeBrowserSession?.activeTabId, 'input.keyboardPress');
-        result = await dispatchKeyboardPress(normalized, { activeTabId: session.activeTabId || activeBrowserSession?.activeTabId });
+      case 'input.keyboardPress': {
+        await requireActiveControlledTabLease(session, normalized.tabId || session.activeTabId, 'input.keyboardPress');
+        const tabId = normalized.tabId || session.activeTabId;
+        const focused = await sendRequestContent(tabId, 'xwow-data-ai:focus-element', normalized);
+        if (!focused.success) { result = focused; break; }
+        requestSignal.throwIfAborted();
+        result = await dispatchKeyboardPress({ ...normalized, selector: undefined }, { activeTabId: tabId, signal: requestSignal });
         break;
+      }
       case 'input.keyboardCombo':
         await requireActiveControlledTabLease(session, normalized.tabId || session.activeTabId || activeBrowserSession?.activeTabId, 'input.keyboardCombo');
         result = await dispatchKeyboardCombo(normalized, { activeTabId: session.activeTabId || activeBrowserSession?.activeTabId });
@@ -2142,6 +2179,7 @@ async function runBrowserAction(action, context = {}) {
     actionSuccess = result?.success !== false;
     terminalResponse = {
       success: actionSuccess,
+      cancelled: result?.cancelled === true || result?.response?.cancelled === true,
       sessionId: session.sessionId,
       turnId: session.currentTurnId || session.turnId || '',
       action: normalized.type,
@@ -2179,6 +2217,7 @@ async function runBrowserAction(action, context = {}) {
     }
     terminalResponse = {
       success: false,
+      cancelled: requestSignal?.aborted === true,
       sessionId: session.sessionId,
       turnId: session.currentTurnId || session.turnId || '',
       action: normalized.type,
@@ -2197,9 +2236,11 @@ async function runBrowserAction(action, context = {}) {
       await browserControlRuntime.finishRequest(session.sessionId, {
         publishTabs: false,
         reason: 'browser_action_request_finished',
+        signal: requestSignal,
       }).catch(() => {});
       const finished = await finishBrowserSessionRequest(session.sessionId, activeRequest.requestId, {
         success: actionSuccess,
+        cancelled: terminalResponse?.cancelled === true,
         error: actionError,
         browserError: terminalBrowserError,
         response: terminalResponse,
@@ -2769,6 +2810,7 @@ async function markTurnEnded(sessionId, turnId) {
 
 async function endActiveTurn(session, turnId) {
   const activeTurnId = String(turnId || session?.currentTurnId || session?.turnId || '');
+  await browserControlRuntime.stopSession(session.sessionId, 'turn_ended');
   const cleanup = createCleanupReport('turn_ended', session.sessionId, activeTurnId);
   const active = await runCleanupStep(cleanup, 'read_active_leases', async () => await getSessionActiveLeases(session.sessionId));
   const activeTurnLeases = (active?.leases || []).filter((lease) => !activeTurnId || lease.turnId === activeTurnId);
@@ -3094,6 +3136,7 @@ function normalizeDebuggerSource(source = {}) {
 }
 
 async function createBrowserSession(owner = 'manual_repair', metadata = {}) {
+  await ensureInitialized();
   const created = await createStoredBrowserSession(owner, metadata);
   if (created?.session) {
     await browserControlRuntime.startSession(created.session.sessionId, created.session.currentTurnId || created.session.turnId, {
@@ -3105,6 +3148,7 @@ async function createBrowserSession(owner = 'manual_repair', metadata = {}) {
 }
 
 async function ensureBrowserSession(sessionId, owner = 'manual_repair', metadata = {}, options = {}) {
+  await ensureInitialized();
   const ensured = await ensureStoredBrowserSession(sessionId, owner, metadata, options);
   if (ensured?.session) {
     await browserControlRuntime.startSession(ensured.session.sessionId, ensured.session.currentTurnId || ensured.session.turnId, {

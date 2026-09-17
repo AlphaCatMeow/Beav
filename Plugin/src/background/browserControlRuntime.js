@@ -51,6 +51,7 @@ export function createBrowserControlRuntime(options = {}) {
     const session = getSession(sessionId);
     if (!session) return { success: true, finished: false };
     session.isRunning = false;
+    session.abortController?.abort();
     session.activeRequests = 0;
     session.abortController = null;
     session.updatedAt = new Date().toISOString();
@@ -164,6 +165,7 @@ export function createBrowserControlRuntime(options = {}) {
 
   async function finishRequest(sessionId, opts = {}) {
     const session = getSession(sessionId);
+    if (opts.signal && opts.signal !== session?.abortController?.signal) return { success: true, finished: false, stale: true };
     if (!session) return { success: true, finished: false };
     session.activeRequests = Math.max(0, session.activeRequests - 1);
     if (session.activeRequests === 0) session.abortController = null;

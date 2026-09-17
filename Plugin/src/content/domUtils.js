@@ -1,3 +1,5 @@
+export const documentIdentity = globalThis.crypto?.randomUUID?.() || `document-${Date.now()}-${Math.random()}`;
+
 export function toAbsoluteUrl(value) {
   try {
     return new URL(value || '', location.href).href;
