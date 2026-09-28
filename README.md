@@ -10,14 +10,14 @@
 
 <p align="center">
   <!-- maintenance-days:start -->
-  <img src="https://img.shields.io/badge/%E8%87%AA%202025%20%E5%B9%B4%206%20%E6%9C%88%E8%B5%B7-%E5%B7%B2%E6%8C%81%E7%BB%AD%E7%BB%B4%E6%8A%A4%20480%20%E5%A4%A9-EA580C?style=flat-square&amp;labelColor=9A3412" alt="本项目自 2025 年 6 月起，已持续维护 480 天">
+  <img src="https://img.shields.io/badge/%E8%87%AA%202025%20%E5%B9%B4%206%20%E6%9C%88%E8%B5%B7-%E5%B7%B2%E6%8C%81%E7%BB%AD%E7%BB%B4%E6%8A%A4%20484%20%E5%A4%A9-EA580C?style=flat-square&amp;labelColor=9A3412" alt="本项目自 2025 年 6 月起，已持续维护 484 天">
   <!-- maintenance-days:end -->
 </p>
 
 <p align="center">
   <!-- release-stats:start -->
-  <a href="https://github.com/Jamailar/Beav/releases"><img src="https://img.shields.io/badge/%E5%B7%B2%E5%8F%91%E5%B8%83%20Release-78%20%E4%B8%AA-2563EB?style=flat-square&amp;labelColor=1D4ED8" alt="已发布 78 个 Release 版本"></a>
-  <a href="https://github.com/Jamailar/Beav/releases"><img src="https://img.shields.io/badge/%E7%B4%AF%E8%AE%A1%E5%AE%89%E8%A3%85%E5%8C%85-619%20%E4%B8%AA-14B8A6?style=flat-square&amp;labelColor=0F766E" alt="累计 619 个安装包"></a>
+  <a href="https://github.com/Jamailar/Beav/releases"><img src="https://img.shields.io/badge/%E5%B7%B2%E5%8F%91%E5%B8%83%20Release-82%20%E4%B8%AA-2563EB?style=flat-square&amp;labelColor=1D4ED8" alt="已发布 82 个 Release 版本"></a>
+  <a href="https://github.com/Jamailar/Beav/releases"><img src="https://img.shields.io/badge/%E7%B4%AF%E8%AE%A1%E5%AE%89%E8%A3%85%E5%8C%85-652%20%E4%B8%AA-14B8A6?style=flat-square&amp;labelColor=0F766E" alt="累计 652 个安装包"></a>
   <!-- release-stats:end -->
 </p>
 
@@ -100,6 +100,14 @@ Beav 因此而生：把 AI 变成自媒体工作者真正可持续使用的素�
 主页日报结合当前账号方向整理新闻、热点和可借鉴内容，附带来源链接，支持按周翻阅、未读标记和来源预览。可以从日报加入选题、继续创作，或直接讨论本期内容。关注清单可手动编辑，后续生成会结合运营规划、已保存的长期兴趣和反馈调整。
 
 “账号运营规划”小工具用于阅读与编辑定位、受众、栏目方向和更新节奏，保留未保存草稿，并在 AI 同时更新时提供对照合并。长期偏好按通用、平台与账号范围使用，让后续任务能延续适用的创作要求。
+
+### 热点
+
+热点页面把适合当前账号的内容与各平台热榜放在一起查看。账号热点会展示匹配账号方向的内容，并标出来源平台和榜单位置；平台热榜按来源分栏呈现，方便横向浏览小红书、知乎、V2EX 等平台的热门话题。遇到值得跟进的内容，可以直接发起 AI 讨论，将热点继续转成选题或创作思路。
+
+<p align="center">
+  <img src="./images/hotspots-page.jpg" alt="Beav 热点页面：账号热点与多平台热榜" width="90%">
+</p>
 
 ### 随手可用的小工具
 
@@ -238,9 +246,9 @@ Beav 由 [JambaHailar](https://x.com/JambaHailar) 独立开发和维护。
 
 ## 开源版本说明
 
-本仓库的开源版本用于学习、研究和技术交流，保留了完整的产品架构与核心实现，供社区参考和讨论。
+Beav 的公开开源版本目前停留在 **2.5.0**，基于 **Electron** 构建。该版本保留了当时产品的主要功能与实现，可用于学习、研究和技术交流；对应源码和历史版本请以本仓库的 Git 历史及 Releases 为准。
 
-面向实际用户发布的生产安装包与本仓库并非同步版本：生产版本会持续独立迭代，可能包含尚未公开的功能、优化和适配；因此，开源版本通常会有一定滞后，不作为生产版本的完整或即时镜像。
+面向实际用户持续维护的正式版本已经迁移到 **Tauri + Rust** 技术栈，并在独立的代码基础上继续迭代。它与 2.5.0 的 Electron 开源版本在底层实现和版本进度上并不相同，正式版本也可能包含开源版本没有的功能、性能改进和平台适配。因此，开源版本不是当前正式版的完整或即时镜像；如需使用最新正式版本，请从[官网下载安装](https://beav.me/)。
 
 ## 许可证
 
